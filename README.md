@@ -94,6 +94,7 @@ Important options:
 - `mouse_scroll_lines`: number of lines per mouse wheel tick.
 - `auto_refresh_secs`: background refresh interval. Set to `0` to disable.
 - `default_expand_level`: initial visible tree depth: `server`, `session`, `window`, or `pane`.
+- `log_path`: optional diagnostic log path. If omitted, no log file is written.
 
 ## Row Formats
 
@@ -136,13 +137,15 @@ Menus support both selection plus Enter and direct shortcut keys shown in parent
 
 ## Logs
 
-Remote tmux operations write diagnostic logs to:
+By default, `tmux-gateway` does not write logs.
 
-```bash
-tmux-gateway.log
+To debug failed remote tmux operations, set `log_path` in your config:
+
+```toml
+log_path = "tmux-gateway.log"
 ```
 
-If an operation fails, inspect the recent log entries:
+Then inspect recent entries:
 
 ```bash
 tail -n 80 tmux-gateway.log

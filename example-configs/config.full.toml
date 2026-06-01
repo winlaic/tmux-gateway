@@ -17,6 +17,11 @@ mouse_scroll_lines = 5
 # Set to 0 to disable automatic refresh.
 auto_refresh_secs = 15
 
+# Optional diagnostic log path.
+# By default no log file is written.
+# Uncomment this when debugging failed remote tmux operations.
+# log_path = "tmux-gateway.log"
+
 # Initial visible tree depth.
 # server  = show only servers
 # session = show servers and sessions

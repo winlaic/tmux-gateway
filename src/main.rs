@@ -41,8 +41,6 @@ const DEFAULT_WINDOW_LINE_TEXT: &str = "[Window] {is_active}{window_index}: {win
 const DEFAULT_PANE_LINE_TEXT: &str =
     "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}";
 const STATUS_TTL: Duration = Duration::from_secs(3);
-const LOG_PATH: &str = "tmux-gateway.log";
-
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
@@ -85,6 +83,7 @@ struct RawConfig {
     mouse_scroll_lines: Option<usize>,
     auto_refresh_secs: Option<u64>,
     default_expand_level: Option<String>,
+    log_path: Option<PathBuf>,
     server_line_text: Option<String>,
     session_line_text: Option<String>,
     window_line_text: Option<String>,
@@ -99,6 +98,7 @@ struct Config {
     mouse_scroll_lines: usize,
     auto_refresh_secs: u64,
     default_expand_level: ExpandLevel,
+    log_path: Option<PathBuf>,
     line_formats: LineFormats,
 }
 
@@ -492,6 +492,7 @@ fn normalize_config(raw: RawConfig) -> Result<Config> {
         mouse_scroll_lines,
         auto_refresh_secs,
         default_expand_level,
+        log_path: raw.log_path,
         line_formats: LineFormats {
             server: raw
                 .server_line_text
@@ -1221,7 +1222,11 @@ impl App {
                     self.mode = Mode::Normal;
                     let result = self.run_context_action(action);
                     if let Err(err) = result {
-                        self.set_temp_status(format!("operation failed: {err}; see {LOG_PATH}"));
+                        self.set_temp_status(result_status(
+                            Err(err),
+                            "completed",
+                            self.config.log_path.as_deref(),
+                        ));
                     }
                 } else {
                     self.mode = Mode::Normal;
@@ -1536,6 +1541,7 @@ impl App {
                         host,
                         optional_name(&prompt.value),
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     ),
                     PromptKind::CreateWindow {
                         host,
@@ -1547,29 +1553,37 @@ impl App {
                         after_window.as_deref(),
                         optional_name(&prompt.value),
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     ),
                     PromptKind::RenameSession { host, target } => rename_remote_session(
                         host,
                         target,
                         prompt.value.trim(),
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     ),
                     PromptKind::RenameWindow { host, target } => rename_remote_window(
                         host,
                         target,
                         prompt.value.trim(),
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     ),
                     PromptKind::RenamePane { host, pane } => rename_remote_pane(
                         host,
                         pane,
                         prompt.value.trim(),
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     ),
                 };
                 self.mode = Mode::Normal;
                 self.refresh();
-                self.set_temp_status(result_status(result, prompt_success(&prompt.kind)));
+                self.set_temp_status(result_status(
+                    result,
+                    prompt_success(&prompt.kind),
+                    self.config.log_path.as_deref(),
+                ));
             }
             KeyCode::Backspace => {
                 prompt.value.pop();
@@ -1618,10 +1632,15 @@ impl App {
                     &choice.pane,
                     choice.selected,
                     self.config.connect_timeout_secs,
+                    self.config.log_path.as_deref(),
                 );
                 self.mode = Mode::Normal;
                 self.refresh();
-                self.set_temp_status(result_status(result, "pane split"));
+                self.set_temp_status(result_status(
+                    result,
+                    "pane split",
+                    self.config.log_path.as_deref(),
+                ));
             }
             _ => self.mode = Mode::SplitChoice(choice),
         }
@@ -1653,10 +1672,15 @@ impl App {
                         &choice.pane,
                         choice.selected,
                         self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
                     );
                     self.mode = Mode::Normal;
                     self.refresh();
-                    self.set_temp_status(result_status(result, "pane split"));
+                    self.set_temp_status(result_status(
+                        result,
+                        "pane split",
+                        self.config.log_path.as_deref(),
+                    ));
                 } else {
                     self.mode = Mode::Normal;
                     self.set_temp_status("split cancelled");
@@ -1731,10 +1755,18 @@ impl App {
                 self.set_temp_status("kill cancelled");
             }
             KeyCode::Char('y') => {
-                let result = run_confirm_action(&confirm.action, self.config.connect_timeout_secs);
+                let result = run_confirm_action(
+                    &confirm.action,
+                    self.config.connect_timeout_secs,
+                    self.config.log_path.as_deref(),
+                );
                 self.mode = Mode::Normal;
                 self.refresh();
-                self.set_temp_status(result_status(result, "killed"));
+                self.set_temp_status(result_status(
+                    result,
+                    "killed",
+                    self.config.log_path.as_deref(),
+                ));
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
                 confirm.selected_yes = !confirm.selected_yes;
@@ -1742,11 +1774,18 @@ impl App {
             }
             KeyCode::Enter => {
                 if confirm.selected_yes {
-                    let result =
-                        run_confirm_action(&confirm.action, self.config.connect_timeout_secs);
+                    let result = run_confirm_action(
+                        &confirm.action,
+                        self.config.connect_timeout_secs,
+                        self.config.log_path.as_deref(),
+                    );
                     self.mode = Mode::Normal;
                     self.refresh();
-                    self.set_temp_status(result_status(result, "killed"));
+                    self.set_temp_status(result_status(
+                        result,
+                        "killed",
+                        self.config.log_path.as_deref(),
+                    ));
                 } else {
                     self.mode = Mode::Normal;
                     self.set_temp_status("kill cancelled");
@@ -1777,11 +1816,18 @@ impl App {
                     confirm_choice_at_mouse(mouse.column, mouse.row, self.screen_area)
                 {
                     if selected_yes {
-                        let result =
-                            run_confirm_action(&confirm.action, self.config.connect_timeout_secs);
+                        let result = run_confirm_action(
+                            &confirm.action,
+                            self.config.connect_timeout_secs,
+                            self.config.log_path.as_deref(),
+                        );
                         self.mode = Mode::Normal;
                         self.refresh();
-                        self.set_temp_status(result_status(result, "killed"));
+                        self.set_temp_status(result_status(
+                            result,
+                            "killed",
+                            self.config.log_path.as_deref(),
+                        ));
                     } else {
                         self.mode = Mode::Normal;
                         self.set_temp_status("kill cancelled");
@@ -2868,12 +2914,17 @@ fn attach_host(
     Ok(())
 }
 
-fn create_remote_session(host: &str, name: Option<&str>, connect_timeout_secs: u64) -> Result<()> {
+fn create_remote_session(
+    host: &str,
+    name: Option<&str>,
+    connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
+) -> Result<()> {
     let remote_command = match name {
         Some(name) => format!("tmux new-session -d -s {}", shell_quote(name)),
         None => "tmux new-session -d".to_string(),
     };
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
 fn create_remote_window(
@@ -2882,6 +2933,7 @@ fn create_remote_window(
     after_window: Option<&str>,
     name: Option<&str>,
     connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
 ) -> Result<()> {
     let target = after_window.unwrap_or(target);
     let mut remote_command = format!("tmux new-window -a -t {}", shell_quote(&target));
@@ -2889,7 +2941,7 @@ fn create_remote_window(
         remote_command.push_str(" -n ");
         remote_command.push_str(&shell_quote(name));
     }
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
 fn split_remote_pane(
@@ -2897,13 +2949,14 @@ fn split_remote_pane(
     pane: &str,
     split: SplitChoice,
     connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
 ) -> Result<()> {
     let flag = match split {
         SplitChoice::Vertical => "-v",
         SplitChoice::Horizontal => "-h",
     };
     let remote_command = format!("tmux split-window {flag} -t {}", shell_quote(pane));
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
 fn rename_remote_session(
@@ -2911,6 +2964,7 @@ fn rename_remote_session(
     target: &str,
     new_name: &str,
     connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
 ) -> Result<()> {
     if new_name.is_empty() {
         bail!("session name must not be empty");
@@ -2920,7 +2974,7 @@ fn rename_remote_session(
         shell_quote(target),
         shell_quote(new_name)
     );
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
 fn rename_remote_window(
@@ -2928,6 +2982,7 @@ fn rename_remote_window(
     target: &str,
     new_name: &str,
     connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
 ) -> Result<()> {
     if new_name.is_empty() {
         bail!("window name must not be empty");
@@ -2937,7 +2992,7 @@ fn rename_remote_window(
         shell_quote(target),
         shell_quote(new_name)
     );
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
 fn rename_remote_pane(
@@ -2945,44 +3000,57 @@ fn rename_remote_pane(
     pane: &str,
     new_title: &str,
     connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
 ) -> Result<()> {
     let remote_command = format!(
         "tmux select-pane -t {} -T {}",
         shell_quote(pane),
         shell_quote(new_title)
     );
-    run_remote_tmux(host, &remote_command, connect_timeout_secs)
+    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
 }
 
-fn run_confirm_action(action: &ConfirmAction, connect_timeout_secs: u64) -> Result<()> {
+fn run_confirm_action(
+    action: &ConfirmAction,
+    connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
+) -> Result<()> {
     match action {
         ConfirmAction::KillSession { host, target } => run_remote_tmux(
             host,
             &format!("tmux kill-session -t {}", shell_quote(target)),
             connect_timeout_secs,
+            log_path,
         ),
         ConfirmAction::KillWindow { host, target } => run_remote_tmux(
             host,
             &format!("tmux kill-window -t {}", shell_quote(target)),
             connect_timeout_secs,
+            log_path,
         ),
         ConfirmAction::KillPane { host, pane } => run_remote_tmux(
             host,
             &format!("tmux kill-pane -t {}", shell_quote(pane)),
             connect_timeout_secs,
+            log_path,
         ),
     }
 }
 
-fn run_remote_tmux(host: &str, remote_command: &str, connect_timeout_secs: u64) -> Result<()> {
-    log_remote_command_start(host, remote_command);
+fn run_remote_tmux(
+    host: &str,
+    remote_command: &str,
+    connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
+) -> Result<()> {
+    log_remote_command_start(log_path, host, remote_command);
     let output = Command::new("ssh")
         .args(ssh_options(connect_timeout_secs))
         .arg(host)
         .arg(remote_command)
         .output()
         .with_context(|| format!("failed to start ssh for host {host}"))?;
-    log_remote_command_output(host, remote_command, &output);
+    log_remote_command_output(log_path, host, remote_command, &output);
 
     if output.status.success() {
         return Ok(());
@@ -3098,38 +3166,55 @@ fn ssh_options(connect_timeout_secs: u64) -> Vec<String> {
     ]
 }
 
-fn result_status(result: Result<()>, success: &str) -> String {
+fn result_status(result: Result<()>, success: &str, log_path: Option<&std::path::Path>) -> String {
     match result {
         Ok(()) => success.to_string(),
-        Err(err) => format!("operation failed: {err}; see {LOG_PATH}"),
+        Err(err) => match log_path {
+            Some(path) => format!("operation failed: {err}; see {}", path.display()),
+            None => format!("operation failed: {err}"),
+        },
     }
 }
 
-fn log_remote_command_start(host: &str, remote_command: &str) {
-    append_log(&format!(
-        "[{}] START host={} command={}\n",
-        log_timestamp(),
-        host,
-        remote_command
-    ));
+fn log_remote_command_start(log_path: Option<&std::path::Path>, host: &str, remote_command: &str) {
+    append_log(
+        log_path,
+        &format!(
+            "[{}] START host={} command={}\n",
+            log_timestamp(),
+            host,
+            remote_command
+        ),
+    );
 }
 
-fn log_remote_command_output(host: &str, remote_command: &str, output: &std::process::Output) {
+fn log_remote_command_output(
+    log_path: Option<&std::path::Path>,
+    host: &str,
+    remote_command: &str,
+    output: &std::process::Output,
+) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    append_log(&format!(
-        "[{}] END host={} status={} command={}\nstdout:\n{}\nstderr:\n{}\n---\n",
-        log_timestamp(),
-        host,
-        output.status,
-        remote_command,
-        stdout.trim_end(),
-        stderr.trim_end(),
-    ));
+    append_log(
+        log_path,
+        &format!(
+            "[{}] END host={} status={} command={}\nstdout:\n{}\nstderr:\n{}\n---\n",
+            log_timestamp(),
+            host,
+            output.status,
+            remote_command,
+            stdout.trim_end(),
+            stderr.trim_end(),
+        ),
+    );
 }
 
-fn append_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(LOG_PATH) {
+fn append_log(log_path: Option<&std::path::Path>, message: &str) {
+    let Some(log_path) = log_path else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = file.write_all(message.as_bytes());
     }
 }
@@ -3698,6 +3783,7 @@ host t1
             mouse_scroll_lines: None,
             auto_refresh_secs: None,
             default_expand_level: None,
+            log_path: None,
             server_line_text: None,
             session_line_text: None,
             window_line_text: None,
@@ -3768,6 +3854,7 @@ host t1
                 mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
                 auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
                 default_expand_level: DEFAULT_EXPAND_LEVEL,
+                log_path: None,
                 line_formats: test_line_formats(),
             },
             trees: Vec::new(),
@@ -3803,6 +3890,7 @@ host t1
             mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
             auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
             default_expand_level,
+            log_path: None,
             line_formats: test_line_formats(),
         };
         let expanded = expanded_all(std::slice::from_ref(&tree));
