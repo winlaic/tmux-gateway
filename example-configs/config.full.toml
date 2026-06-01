@@ -1,0 +1,51 @@
+# Hosts to scan.
+# Use an array for explicit SSH host aliases:
+# hosts = ["t1", "t3", "t4"]
+# Use "all" to read every concrete Host entry from ~/.ssh/config.
+hosts = "all"
+
+# SSH connection timeout for scan and remote tmux operations, in seconds.
+connect_timeout_secs = 3
+
+# Number of hosts scanned in parallel.
+scan_concurrency = 32
+
+# Number of tree lines moved per mouse wheel tick.
+mouse_scroll_lines = 5
+
+# Background refresh interval, in seconds.
+# Set to 0 to disable automatic refresh.
+auto_refresh_secs = 15
+
+# Initial visible tree depth.
+# server  = show only servers
+# session = show servers and sessions
+# window  = show servers, sessions, and windows
+# pane    = show the full tree
+default_expand_level = "server"
+
+# Server row format.
+# Placeholders:
+# {server_name} {host} {session_count} {window_count} {pane_count}
+# {process_status} {process_elapsed_time}
+server_line_text = "[Server] {server_name}"
+
+# Session row format.
+# Placeholders:
+# {server_name} {host} {session_name} {window_count} {pane_count}
+# {process_status} {process_elapsed_time}
+session_line_text = "[Session] {session_name}"
+
+# Window row format.
+# Placeholders:
+# {server_name} {host} {session_name} {window_index} {window_name}
+# {window_panes} {is_active} {process_status} {process_elapsed_time}
+window_line_text = "[Window] {is_active}{window_index}: {window_name}"
+
+# Pane row format.
+# Placeholders:
+# {server_name} {host} {session_name} {window_index} {window_name}
+# {pane_index} {pane_id} {pane_pid} {pane_current_command} {pane_command}
+# {pane_commandline} {pane_title} {pane_title_prefix} {is_active}
+# {process_status} {process_elapsed_time}
+pane_line_text = "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}"
