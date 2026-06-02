@@ -181,7 +181,15 @@ struct VisibleRow {
     detail: String,
     search_text: String,
     selectable: bool,
+    expandable: bool,
+    status: RowStatus,
     busy_duration_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowStatus {
+    Normal,
+    Unavailable,
 }
 
 struct App {
@@ -201,8 +209,15 @@ struct App {
     last_search_direction: SearchDirection,
     mode: Mode,
     pending_g: bool,
+    default_expand_pending: bool,
     attach_request: Option<AttachTarget>,
-    refresh_request: bool,
+    refresh_request: Option<RefreshRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RefreshRequest {
+    All,
+    Hosts(Vec<String>),
 }
 
 struct ScanTask {
@@ -224,16 +239,23 @@ impl ScanTask {
         self.receiver.is_some()
     }
 
-    fn start(&mut self) {
+    fn start_all(&mut self) {
+        self.start_hosts(self.config.hosts.clone());
+    }
+
+    fn start_hosts(&mut self, hosts: Vec<String>) {
         if self.is_running() {
+            return;
+        }
+        if hosts.is_empty() {
             return;
         }
 
         let (sender, receiver) = mpsc::channel();
-        self.pending = self.config.hosts.len();
+        self.pending = hosts.len();
         self.receiver = Some(receiver);
         let config = self.config.clone();
-        thread::spawn(move || collect_hosts_streaming(&config, sender));
+        thread::spawn(move || collect_hosts_streaming(&config, &hosts, sender));
     }
 
     fn drain(&mut self) -> Vec<HostTree> {
@@ -390,6 +412,18 @@ enum PromptKind {
     },
 }
 
+impl PromptKind {
+    fn host(&self) -> &str {
+        match self {
+            Self::CreateSession { host }
+            | Self::CreateWindow { host, .. }
+            | Self::RenameSession { host, .. }
+            | Self::RenameWindow { host, .. }
+            | Self::RenamePane { host, .. } => host,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SplitChoiceState {
     host: String,
@@ -416,6 +450,16 @@ enum ConfirmAction {
     KillSession { host: String, target: String },
     KillWindow { host: String, target: String },
     KillPane { host: String, pane: String },
+}
+
+impl ConfirmAction {
+    fn host(&self) -> &str {
+        match self {
+            Self::KillSession { host, .. }
+            | Self::KillWindow { host, .. }
+            | Self::KillPane { host, .. } => host,
+        }
+    }
 }
 
 struct TerminalGuard;
@@ -629,7 +673,7 @@ fn run_tui(config: Config) -> Result<()> {
     let mut app = App::new(config);
     let mut scan_task = ScanTask::new(app.config.clone());
     let mut auto_refresh = AutoRefresh::new(&app.config);
-    scan_task.start();
+    scan_task.start_all();
 
     enable_raw_mode().context("failed to enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
@@ -641,11 +685,14 @@ fn run_tui(config: Config) -> Result<()> {
 
     loop {
         app.apply_scan_results(scan_task.drain());
-        if app.take_refresh_request() {
-            scan_task.start();
+        if let Some(request) = app.take_refresh_request() {
+            match request {
+                RefreshRequest::All => scan_task.start_all(),
+                RefreshRequest::Hosts(hosts) => scan_task.start_hosts(hosts),
+            }
         }
         if auto_refresh.should_start(&scan_task) {
-            scan_task.start();
+            scan_task.start_all();
             app.set_temp_status("refreshing in background");
         }
         terminal.draw(|frame| draw_app(frame, &mut app))?;
@@ -680,7 +727,7 @@ fn run_tui(config: Config) -> Result<()> {
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
-            scan_task.start();
+            scan_task.start_hosts(vec![target.host.clone()]);
             app.set_temp_status(match result {
                 Ok(()) => "detached; refreshing tree".to_string(),
                 Err(err) => format!("attach failed: {err}"),
@@ -711,8 +758,9 @@ impl App {
             last_search_direction: SearchDirection::Down,
             mode: Mode::Normal,
             pending_g: false,
+            default_expand_pending: true,
             attach_request: None,
-            refresh_request: false,
+            refresh_request: None,
         };
         app.initialize_connecting_hosts();
         app
@@ -752,7 +800,7 @@ impl App {
     }
 
     fn apply_trees_after_refresh(&mut self) {
-        self.expand_initial();
+        self.expand_initial_if_ready();
         self.rebuild_rows();
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.clamp_scroll();
@@ -778,10 +826,11 @@ impl App {
         self.status.clone()
     }
 
-    fn expand_initial(&mut self) {
-        if !self.expanded.is_empty() {
+    fn expand_initial_if_ready(&mut self) {
+        if !self.default_expand_pending || self.trees.iter().any(|tree| tree.connecting) {
             return;
         }
+        self.default_expand_pending = false;
 
         if self.config.default_expand_level == ExpandLevel::Server {
             return;
@@ -819,6 +868,8 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
+        let expandable = expandable_node_ids(&self.trees);
+        self.expanded.retain(|id| expandable.contains(id));
         self.rows = build_rows(&self.trees, &self.expanded, &self.config.line_formats);
     }
 
@@ -855,7 +906,7 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        if matches!(row.id, NodeId::Pane { .. }) {
+        if !row.expandable {
             return;
         }
         self.expanded.insert(row.id.clone());
@@ -889,7 +940,7 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        if matches!(row.id, NodeId::Pane { .. }) {
+        if !row.expandable {
             return;
         }
 
@@ -972,10 +1023,16 @@ impl App {
         self.attach_request.take()
     }
 
-    fn take_refresh_request(&mut self) -> bool {
-        let requested = self.refresh_request;
-        self.refresh_request = false;
-        requested
+    fn request_refresh_all(&mut self) {
+        self.refresh_request = Some(RefreshRequest::All);
+    }
+
+    fn request_refresh_host(&mut self, host: impl Into<String>) {
+        self.refresh_request = Some(RefreshRequest::Hosts(vec![host.into()]));
+    }
+
+    fn take_refresh_request(&mut self) -> Option<RefreshRequest> {
+        self.refresh_request.take()
     }
 
     fn clamp_scroll(&mut self) {
@@ -1375,7 +1432,7 @@ impl App {
             KeyCode::Char('n') => self.repeat_search(self.last_search_direction),
             KeyCode::Char('N') => self.repeat_search(self.last_search_direction.reversed()),
             KeyCode::Char('r') => {
-                self.refresh_request = true;
+                self.request_refresh_all();
                 self.set_temp_status("refreshing in background");
             }
             KeyCode::Char('G') => self.select_last(),
@@ -1398,6 +1455,7 @@ impl App {
 
     fn start_search(&mut self, direction: SearchDirection) {
         self.pending_g = false;
+        self.search.clear();
         self.search_direction = direction;
         self.last_search_direction = direction;
         self.mode = Mode::Search;
@@ -1660,7 +1718,7 @@ impl App {
                     ),
                 };
                 self.mode = Mode::Normal;
-                self.refresh_request = true;
+                self.request_refresh_host(prompt.kind.host().to_string());
                 self.set_temp_status(result_status(
                     result,
                     prompt_success(&prompt.kind),
@@ -1717,7 +1775,7 @@ impl App {
                     self.config.log_path.as_deref(),
                 );
                 self.mode = Mode::Normal;
-                self.refresh_request = true;
+                self.request_refresh_host(choice.host.clone());
                 self.set_temp_status(result_status(
                     result,
                     "pane split",
@@ -1757,7 +1815,7 @@ impl App {
                         self.config.log_path.as_deref(),
                     );
                     self.mode = Mode::Normal;
-                    self.refresh_request = true;
+                    self.request_refresh_host(choice.host.clone());
                     self.set_temp_status(result_status(
                         result,
                         "pane split",
@@ -1843,7 +1901,7 @@ impl App {
                     self.config.log_path.as_deref(),
                 );
                 self.mode = Mode::Normal;
-                self.refresh_request = true;
+                self.request_refresh_host(confirm.action.host().to_string());
                 self.set_temp_status(result_status(
                     result,
                     "killed",
@@ -1862,7 +1920,7 @@ impl App {
                         self.config.log_path.as_deref(),
                     );
                     self.mode = Mode::Normal;
-                    self.refresh_request = true;
+                    self.request_refresh_host(confirm.action.host().to_string());
                     self.set_temp_status(result_status(
                         result,
                         "killed",
@@ -1904,7 +1962,7 @@ impl App {
                             self.config.log_path.as_deref(),
                         );
                         self.mode = Mode::Normal;
-                        self.refresh_request = true;
+                        self.request_refresh_host(confirm.action.host().to_string());
                         self.set_temp_status(result_status(
                             result,
                             "killed",
@@ -2040,29 +2098,40 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .map(|(index, row)| {
             let selected = index == app.selected;
             let indent = "  ".repeat(row.depth);
-            let marker = match row.id {
-                NodeId::Pane { .. } => " ",
-                _ if app.expanded.contains(&row.id) => "▾",
-                _ => "▸",
+            let marker = if !row.expandable {
+                " "
+            } else if app.expanded.contains(&row.id) {
+                "▾"
+            } else {
+                "▸"
             };
             let main_style = if row.selectable {
                 Style::default().fg(Color::White)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let main_style = if row.busy_duration_secs.is_some() {
+            let main_style = if row.status == RowStatus::Unavailable {
+                main_style.fg(Color::LightRed).add_modifier(Modifier::BOLD)
+            } else if row.busy_duration_secs.is_some() {
                 main_style
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD)
             } else {
                 main_style
             };
-            let detail_style = if row.busy_duration_secs.is_some() {
-                Style::default().fg(Color::LightGreen)
+            let detail_style = if row.status == RowStatus::Unavailable {
+                Style::default().fg(Color::Rgb(120, 48, 48))
+            } else if row.busy_duration_secs.is_some() {
+                Style::default().fg(Color::Rgb(55, 120, 70))
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let row_style = if selected && row.busy_duration_secs.is_some() {
+            let row_style = if selected && row.status == RowStatus::Unavailable {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected && row.busy_duration_secs.is_some() {
                 Style::default()
                     .bg(Color::DarkGray)
                     .fg(Color::LightGreen)
@@ -2313,19 +2382,19 @@ fn collect_hosts(config: &Config) -> Vec<HostTree> {
     }
 }
 
-fn collect_hosts_streaming(config: &Config, sender: mpsc::Sender<HostTree>) {
+fn collect_hosts_streaming(config: &Config, hosts: &[String], sender: mpsc::Sender<HostTree>) {
     let pool = ThreadPoolBuilder::new()
         .num_threads(config.scan_concurrency)
         .build();
 
     match pool {
         Ok(pool) => pool.install(|| {
-            config.hosts.par_iter().for_each(|host| {
+            hosts.par_iter().for_each(|host| {
                 let _ = sender.send(collect_host(host, config.connect_timeout_secs));
             });
         }),
         Err(_) => {
-            for host in &config.hosts {
+            for host in hosts {
                 let _ = sender.send(collect_host(host, config.connect_timeout_secs));
             }
         }
@@ -2606,13 +2675,20 @@ fn build_rows(
 
     for tree in trees {
         let host_id = NodeId::Host(tree.host.clone());
+        let detail = host_detail(tree);
         rows.push(VisibleRow {
             id: host_id.clone(),
             depth: 0,
             label: format_server_line(tree, line_formats),
-            detail: host_detail(tree),
-            search_text: format!("{} {}", tree.host, host_detail(tree)),
+            detail: detail.clone(),
+            search_text: format!("{} {}", tree.host, detail),
             selectable: false,
+            expandable: !tree.panes.is_empty(),
+            status: if tree.error.is_some() {
+                RowStatus::Unavailable
+            } else {
+                RowStatus::Normal
+            },
             busy_duration_secs: (!expanded.contains(&host_id))
                 .then(|| max_busy_duration(tree.panes.iter()))
                 .flatten(),
@@ -2639,6 +2715,8 @@ fn build_rows(
                 detail: format!("{} windows", windows.len()),
                 search_text: session_name.clone(),
                 selectable: false,
+                expandable: !windows.is_empty(),
+                status: RowStatus::Normal,
                 busy_duration_secs: (!expanded.contains(&session_id))
                     .then(|| max_busy_duration(windows.values().flatten().copied()))
                     .flatten(),
@@ -2668,6 +2746,8 @@ fn build_rows(
                     detail: format!("{} panes", panes.len()),
                     search_text: format!("{} {}", window_index, first.window_name),
                     selectable: true,
+                    expandable: !panes.is_empty(),
+                    status: RowStatus::Normal,
                     busy_duration_secs: (!expanded.contains(&window_id))
                         .then(|| max_busy_duration(panes.iter().copied()))
                         .flatten(),
@@ -2703,6 +2783,8 @@ fn build_rows(
                             pane.pane_title
                         ),
                         selectable: true,
+                        expandable: false,
+                        status: RowStatus::Normal,
                         busy_duration_secs: pane.busy_duration_secs,
                     });
                 }
@@ -2711,6 +2793,41 @@ fn build_rows(
     }
 
     rows
+}
+
+fn expandable_node_ids(trees: &[HostTree]) -> BTreeSet<NodeId> {
+    let mut ids = BTreeSet::new();
+
+    for tree in trees {
+        if tree.panes.is_empty() {
+            continue;
+        }
+
+        ids.insert(NodeId::Host(tree.host.clone()));
+        for (session_name, windows) in group_tree(tree) {
+            if windows.is_empty() {
+                continue;
+            }
+
+            ids.insert(NodeId::Session {
+                host: tree.host.clone(),
+                session: session_name.clone(),
+            });
+
+            for (window_index, panes) in windows {
+                if panes.is_empty() {
+                    continue;
+                }
+                ids.insert(NodeId::Window {
+                    host: tree.host.clone(),
+                    session: session_name.clone(),
+                    window: window_index,
+                });
+            }
+        }
+    }
+
+    ids
 }
 
 fn format_server_line(tree: &HostTree, line_formats: &LineFormats) -> String {
@@ -2933,7 +3050,7 @@ fn host_detail(tree: &HostTree) -> String {
         return format!("unavailable: {error}");
     }
     if tree.panes.is_empty() {
-        return "no tmux server for ssh user".to_string();
+        return String::new();
     }
 
     let sessions = group_tree(tree);
@@ -3640,6 +3757,46 @@ host t1
     }
 
     #[test]
+    fn empty_host_is_not_expandable() {
+        let tree = HostTree {
+            host: "empty".to_string(),
+            panes: Vec::new(),
+            error: None,
+            connecting: false,
+        };
+        let mut app = test_app_with_tree_at_level(tree, ExpandLevel::Server);
+
+        assert_eq!(app.rows.len(), 1);
+        assert!(!app.rows[0].expandable);
+
+        app.expand_selected();
+        assert!(app.expanded.is_empty());
+
+        app.toggle_selected();
+        assert!(app.expanded.is_empty());
+    }
+
+    #[test]
+    fn refreshed_empty_node_loses_previous_expand_state() {
+        let mut tree = test_host_tree("t2");
+        let host_id = NodeId::Host("t2".to_string());
+        let mut app = test_app_with_tree_at_level(tree.clone(), ExpandLevel::Pane);
+        assert!(app.expanded.contains(&host_id));
+        assert!(!app.default_expand_pending);
+
+        tree.panes.clear();
+        app.apply_scan_results(vec![tree.clone()]);
+        assert!(!app.expanded.contains(&host_id));
+        assert!(!app.rows[0].expandable);
+
+        tree.panes.push(test_pane());
+        app.apply_scan_results(vec![tree]);
+        assert!(!app.expanded.contains(&host_id));
+        assert!(app.rows[0].expandable);
+        assert_eq!(app.rows.len(), 1);
+    }
+
+    #[test]
     fn context_menu_new_items_match_node_level() {
         let tree = test_host_tree("t2");
         let mut app = test_app_with_tree(tree);
@@ -3957,6 +4114,80 @@ host t1
     }
 
     #[test]
+    fn host_detail_is_empty_when_tmux_is_not_running() {
+        let tree = HostTree {
+            host: "t2".to_string(),
+            panes: Vec::new(),
+            error: None,
+            connecting: false,
+        };
+        let rows = build_rows(&[tree.clone()], &BTreeSet::new(), &test_line_formats());
+
+        assert_eq!(host_detail(&tree), "");
+        assert_eq!(rows[0].detail, "");
+        assert_eq!(rows[0].status, RowStatus::Normal);
+    }
+
+    #[test]
+    fn unavailable_host_row_is_marked_for_error_styling() {
+        let tree = HostTree {
+            host: "t2".to_string(),
+            panes: Vec::new(),
+            error: Some("ssh timeout".to_string()),
+            connecting: false,
+        };
+        let rows = build_rows(&[tree], &BTreeSet::new(), &test_line_formats());
+
+        assert_eq!(rows[0].status, RowStatus::Unavailable);
+        assert!(rows[0].detail.contains("ssh timeout"));
+    }
+
+    #[test]
+    fn refresh_requests_can_target_all_or_one_host() {
+        let mut app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
+
+        app.request_refresh_all();
+        assert_eq!(app.take_refresh_request(), Some(RefreshRequest::All));
+
+        app.request_refresh_host("t2");
+        assert_eq!(
+            app.take_refresh_request(),
+            Some(RefreshRequest::Hosts(vec!["t2".to_string()]))
+        );
+    }
+
+    #[test]
+    fn starting_search_clears_previous_input() {
+        let mut app = test_app_with_rows(3);
+        app.search = "old".to_string();
+
+        app.start_search(SearchDirection::Down);
+
+        assert_eq!(app.search, "");
+        assert_eq!(app.search_prompt(), "/");
+    }
+
+    #[test]
+    fn tmux_mutation_actions_report_their_host() {
+        assert_eq!(
+            PromptKind::RenameWindow {
+                host: "t2".to_string(),
+                target: "@1".to_string(),
+            }
+            .host(),
+            "t2"
+        );
+        assert_eq!(
+            ConfirmAction::KillPane {
+                host: "t3".to_string(),
+                pane: "%4".to_string(),
+            }
+            .host(),
+            "t3"
+        );
+    }
+
+    #[test]
     fn default_auto_refresh_interval_is_configured() {
         let raw = RawConfig {
             hosts: Some(Value::Array(vec![Value::String("t2".to_string())])),
@@ -3997,15 +4228,11 @@ host t1
     #[test]
     fn default_expand_level_controls_initial_visible_depth() {
         let tree = test_host_tree("t2");
-        let mut app = test_app_with_tree_at_level(tree.clone(), ExpandLevel::Server);
-        app.expanded.clear();
-        app.apply_trees_after_refresh();
+        let app = test_app_with_tree_at_level(tree.clone(), ExpandLevel::Server);
         assert_eq!(app.rows.len(), 1);
         assert!(matches!(app.rows[0].id, NodeId::Host(_)));
 
-        let mut app = test_app_with_tree_at_level(tree.clone(), ExpandLevel::Window);
-        app.expanded.clear();
-        app.apply_trees_after_refresh();
+        let app = test_app_with_tree_at_level(tree.clone(), ExpandLevel::Window);
         assert!(
             app.rows
                 .iter()
@@ -4017,9 +4244,7 @@ host t1
                 .any(|row| matches!(row.id, NodeId::Pane { .. }))
         );
 
-        let mut app = test_app_with_tree_at_level(tree, ExpandLevel::Pane);
-        app.expanded.clear();
-        app.apply_trees_after_refresh();
+        let app = test_app_with_tree_at_level(tree, ExpandLevel::Pane);
         assert!(
             app.rows
                 .iter()
@@ -4056,8 +4281,9 @@ host t1
             last_search_direction: SearchDirection::Down,
             mode: Mode::Normal,
             pending_g: false,
+            default_expand_pending: false,
             attach_request: None,
-            refresh_request: false,
+            refresh_request: None,
         }
     }
 
@@ -4076,13 +4302,11 @@ host t1
             log_path: None,
             line_formats: test_line_formats(),
         };
-        let expanded = expanded_all(std::slice::from_ref(&tree));
-        let rows = build_rows(std::slice::from_ref(&tree), &expanded, &config.line_formats);
-        App {
+        let mut app = App {
             config,
             trees: vec![tree],
-            expanded,
-            rows,
+            expanded: BTreeSet::new(),
+            rows: Vec::new(),
             selected: 0,
             scroll_offset: 0,
             viewport_height: 10,
@@ -4095,9 +4319,12 @@ host t1
             last_search_direction: SearchDirection::Down,
             mode: Mode::Normal,
             pending_g: false,
+            default_expand_pending: true,
             attach_request: None,
-            refresh_request: false,
-        }
+            refresh_request: None,
+        };
+        app.apply_trees_after_refresh();
+        app
     }
 
     fn test_app_with_hosts(hosts: Vec<String>) -> App {
@@ -4171,6 +4398,8 @@ host t1
             detail: String::new(),
             search_text: search_text.to_string(),
             selectable: false,
+            expandable: false,
+            status: RowStatus::Normal,
             busy_duration_secs: None,
         }
     }
