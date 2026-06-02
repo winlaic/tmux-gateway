@@ -150,6 +150,7 @@ struct HostTree {
     host: String,
     panes: Vec<PaneInfo>,
     error: Option<String>,
+    connecting: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -201,60 +202,95 @@ struct App {
     mode: Mode,
     pending_g: bool,
     attach_request: Option<AttachTarget>,
+    refresh_request: bool,
 }
 
-struct AutoRefresh {
+struct ScanTask {
     config: Config,
-    interval: Option<Duration>,
-    next_refresh: Instant,
-    receiver: Option<Receiver<Vec<HostTree>>>,
+    receiver: Option<Receiver<HostTree>>,
+    pending: usize,
 }
 
-impl AutoRefresh {
+impl ScanTask {
     fn new(config: Config) -> Self {
-        let interval =
-            (config.auto_refresh_secs > 0).then(|| Duration::from_secs(config.auto_refresh_secs));
         Self {
             config,
-            interval,
-            next_refresh: Instant::now() + interval.unwrap_or_default(),
             receiver: None,
+            pending: 0,
         }
     }
 
-    fn poll(&mut self) -> Option<Vec<HostTree>> {
-        let Some(interval) = self.interval else {
-            return None;
+    fn is_running(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    fn start(&mut self) {
+        if self.is_running() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.pending = self.config.hosts.len();
+        self.receiver = Some(receiver);
+        let config = self.config.clone();
+        thread::spawn(move || collect_hosts_streaming(&config, sender));
+    }
+
+    fn drain(&mut self) -> Vec<HostTree> {
+        let mut trees = Vec::new();
+        let Some(receiver) = self.receiver.take() else {
+            return trees;
         };
 
-        if let Some(receiver) = self.receiver.take() {
+        loop {
             match receiver.try_recv() {
-                Ok(trees) => {
-                    self.next_refresh = Instant::now() + interval;
-                    return Some(trees);
+                Ok(tree) => {
+                    self.pending = self.pending.saturating_sub(1);
+                    trees.push(tree);
+                    if self.pending == 0 {
+                        return trees;
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     self.receiver = Some(receiver);
-                    return None;
+                    return trees;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.next_refresh = Instant::now() + interval;
-                    return None;
+                    self.pending = 0;
+                    return trees;
                 }
             }
         }
+    }
+}
 
-        if Instant::now() >= self.next_refresh {
-            let (sender, receiver) = mpsc::channel();
-            let config = self.config.clone();
-            thread::spawn(move || {
-                let _ = sender.send(collect_hosts(&config));
-            });
-            self.receiver = Some(receiver);
-            self.next_refresh = Instant::now() + interval;
+struct AutoRefresh {
+    interval: Option<Duration>,
+    next_refresh: Instant,
+}
+
+impl AutoRefresh {
+    fn new(config: &Config) -> Self {
+        let interval =
+            (config.auto_refresh_secs > 0).then(|| Duration::from_secs(config.auto_refresh_secs));
+        Self {
+            interval,
+            next_refresh: Instant::now() + interval.unwrap_or_default(),
         }
+    }
 
-        None
+    fn should_start(&mut self, scan_task: &ScanTask) -> bool {
+        let Some(interval) = self.interval else {
+            return false;
+        };
+        if scan_task.is_running() {
+            return false;
+        }
+        if Instant::now() >= self.next_refresh {
+            self.next_refresh = Instant::now() + interval;
+            return true;
+        }
+        false
     }
 }
 
@@ -591,7 +627,9 @@ fn ensure_configured_host(config: &Config, host: &str) -> Result<()> {
 
 fn run_tui(config: Config) -> Result<()> {
     let mut app = App::new(config);
-    let mut auto_refresh = AutoRefresh::new(app.config.clone());
+    let mut scan_task = ScanTask::new(app.config.clone());
+    let mut auto_refresh = AutoRefresh::new(&app.config);
+    scan_task.start();
 
     enable_raw_mode().context("failed to enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
@@ -602,7 +640,14 @@ fn run_tui(config: Config) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     loop {
-        app.apply_auto_refresh(&mut auto_refresh);
+        app.apply_scan_results(scan_task.drain());
+        if app.take_refresh_request() {
+            scan_task.start();
+        }
+        if auto_refresh.should_start(&scan_task) {
+            scan_task.start();
+            app.set_temp_status("refreshing in background");
+        }
         terminal.draw(|frame| draw_app(frame, &mut app))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -635,9 +680,9 @@ fn run_tui(config: Config) -> Result<()> {
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
-            app.refresh();
+            scan_task.start();
             app.set_temp_status(match result {
-                Ok(()) => "detached; refreshed tree".to_string(),
+                Ok(()) => "detached; refreshing tree".to_string(),
                 Err(err) => format!("attach failed: {err}"),
             });
         }
@@ -667,25 +712,43 @@ impl App {
             mode: Mode::Normal,
             pending_g: false,
             attach_request: None,
+            refresh_request: false,
         };
-        app.refresh();
+        app.initialize_connecting_hosts();
         app
     }
 
-    fn refresh(&mut self) {
-        self.trees = collect_hosts(&self.config);
+    fn initialize_connecting_hosts(&mut self) {
+        self.trees = self
+            .config
+            .hosts
+            .iter()
+            .map(|host| HostTree {
+                host: host.clone(),
+                panes: Vec::new(),
+                error: None,
+                connecting: true,
+            })
+            .collect();
         self.apply_trees_after_refresh();
         self.set_status(DEFAULT_STATUS);
-        self.apply_search_from_current();
     }
 
-    fn apply_auto_refresh(&mut self, auto_refresh: &mut AutoRefresh) {
-        if let Some(trees) = auto_refresh.poll() {
-            self.trees = trees;
-            self.apply_trees_after_refresh();
-            self.apply_search_from_current();
-            self.set_temp_status("auto refreshed");
+    fn apply_scan_results(&mut self, trees: Vec<HostTree>) {
+        if trees.is_empty() {
+            return;
         }
+
+        for tree in trees {
+            if let Some(existing) = self.trees.iter_mut().find(|item| item.host == tree.host) {
+                *existing = tree;
+            } else {
+                self.trees.push(tree);
+            }
+        }
+        sort_trees_by_config(&mut self.trees, &self.config.hosts);
+        self.apply_trees_after_refresh();
+        self.apply_search_from_current();
     }
 
     fn apply_trees_after_refresh(&mut self) {
@@ -894,6 +957,12 @@ impl App {
 
     fn take_attach_request(&mut self) -> Option<AttachTarget> {
         self.attach_request.take()
+    }
+
+    fn take_refresh_request(&mut self) -> bool {
+        let requested = self.refresh_request;
+        self.refresh_request = false;
+        requested
     }
 
     fn clamp_scroll(&mut self) {
@@ -1293,8 +1362,8 @@ impl App {
             KeyCode::Char('n') => self.repeat_search(self.last_search_direction),
             KeyCode::Char('N') => self.repeat_search(self.last_search_direction.reversed()),
             KeyCode::Char('r') => {
-                self.refresh();
-                self.set_temp_status("refreshed");
+                self.refresh_request = true;
+                self.set_temp_status("refreshing in background");
             }
             KeyCode::Char('G') => self.select_last(),
             KeyCode::Char('g') if self.pending_g => self.select_first(),
@@ -1578,7 +1647,7 @@ impl App {
                     ),
                 };
                 self.mode = Mode::Normal;
-                self.refresh();
+                self.refresh_request = true;
                 self.set_temp_status(result_status(
                     result,
                     prompt_success(&prompt.kind),
@@ -1635,7 +1704,7 @@ impl App {
                     self.config.log_path.as_deref(),
                 );
                 self.mode = Mode::Normal;
-                self.refresh();
+                self.refresh_request = true;
                 self.set_temp_status(result_status(
                     result,
                     "pane split",
@@ -1675,7 +1744,7 @@ impl App {
                         self.config.log_path.as_deref(),
                     );
                     self.mode = Mode::Normal;
-                    self.refresh();
+                    self.refresh_request = true;
                     self.set_temp_status(result_status(
                         result,
                         "pane split",
@@ -1761,7 +1830,7 @@ impl App {
                     self.config.log_path.as_deref(),
                 );
                 self.mode = Mode::Normal;
-                self.refresh();
+                self.refresh_request = true;
                 self.set_temp_status(result_status(
                     result,
                     "killed",
@@ -1780,7 +1849,7 @@ impl App {
                         self.config.log_path.as_deref(),
                     );
                     self.mode = Mode::Normal;
-                    self.refresh();
+                    self.refresh_request = true;
                     self.set_temp_status(result_status(
                         result,
                         "killed",
@@ -1822,7 +1891,7 @@ impl App {
                             self.config.log_path.as_deref(),
                         );
                         self.mode = Mode::Normal;
-                        self.refresh();
+                        self.refresh_request = true;
                         self.set_temp_status(result_status(
                             result,
                             "killed",
@@ -2231,19 +2300,49 @@ fn collect_hosts(config: &Config) -> Vec<HostTree> {
     }
 }
 
+fn collect_hosts_streaming(config: &Config, sender: mpsc::Sender<HostTree>) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config.scan_concurrency)
+        .build();
+
+    match pool {
+        Ok(pool) => pool.install(|| {
+            config.hosts.par_iter().for_each(|host| {
+                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+            });
+        }),
+        Err(_) => {
+            for host in &config.hosts {
+                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+            }
+        }
+    }
+}
+
 fn collect_host(host: &str, connect_timeout_secs: u64) -> HostTree {
     match list_remote_panes(host, connect_timeout_secs) {
         Ok(panes) => HostTree {
             host: host.to_string(),
             panes,
             error: None,
+            connecting: false,
         },
         Err(err) => HostTree {
             host: host.to_string(),
             panes: Vec::new(),
             error: Some(err.to_string()),
+            connecting: false,
         },
     }
+}
+
+fn sort_trees_by_config(trees: &mut [HostTree], hosts: &[String]) {
+    let order: BTreeMap<&str, usize> = hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| (host.as_str(), index))
+        .collect();
+    trees.sort_by_key(|tree| order.get(tree.host.as_str()).copied().unwrap_or(usize::MAX));
 }
 
 fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneInfo>> {
@@ -2807,6 +2906,9 @@ enum SearchStart {
 }
 
 fn host_detail(tree: &HostTree) -> String {
+    if tree.connecting {
+        return "connecting ...".to_string();
+    }
     if let Some(error) = &tree.error {
         return format!("unavailable: {error}");
     }
@@ -3775,6 +3877,33 @@ host t1
     }
 
     #[test]
+    fn app_starts_with_connecting_placeholders() {
+        let app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
+
+        assert_eq!(app.trees.len(), 2);
+        assert!(app.trees.iter().all(|tree| tree.connecting));
+        assert_eq!(host_detail(&app.trees[0]), "connecting ...");
+    }
+
+    #[test]
+    fn scan_results_replace_single_connecting_host() {
+        let mut app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
+
+        app.apply_scan_results(vec![test_host_tree("t2")]);
+
+        assert!(
+            app.trees
+                .iter()
+                .find(|tree| tree.host == "t1")
+                .unwrap()
+                .connecting
+        );
+        let t2 = app.trees.iter().find(|tree| tree.host == "t2").unwrap();
+        assert!(!t2.connecting);
+        assert_eq!(t2.panes.len(), 1);
+    }
+
+    #[test]
     fn default_auto_refresh_interval_is_configured() {
         let raw = RawConfig {
             hosts: Some(Value::Array(vec![Value::String("t2".to_string())])),
@@ -3875,6 +4004,7 @@ host t1
             mode: Mode::Normal,
             pending_g: false,
             attach_request: None,
+            refresh_request: false,
         }
     }
 
@@ -3913,7 +4043,21 @@ host t1
             mode: Mode::Normal,
             pending_g: false,
             attach_request: None,
+            refresh_request: false,
         }
+    }
+
+    fn test_app_with_hosts(hosts: Vec<String>) -> App {
+        App::new(Config {
+            hosts,
+            connect_timeout_secs: 1,
+            scan_concurrency: 1,
+            mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
+            auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
+            default_expand_level: DEFAULT_EXPAND_LEVEL,
+            log_path: None,
+            line_formats: test_line_formats(),
+        })
     }
 
     fn test_host_tree(host: &str) -> HostTree {
@@ -3921,6 +4065,7 @@ host t1
             host: host.to_string(),
             panes: vec![test_pane()],
             error: None,
+            connecting: false,
         }
     }
 
