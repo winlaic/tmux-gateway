@@ -827,14 +827,27 @@ impl App {
         if self.rows.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.rows.len() - 1);
-        self.keep_selected_visible_down();
+        if self.selected + 1 >= self.rows.len() {
+            self.selected = 0;
+            self.scroll_offset = 0;
+        } else {
+            self.selected += 1;
+            self.keep_selected_visible_down();
+        }
     }
 
     fn select_previous(&mut self) {
         self.pending_g = false;
-        self.selected = self.selected.saturating_sub(1);
-        self.keep_selected_visible_up();
+        if self.rows.is_empty() {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = self.rows.len() - 1;
+            self.keep_selected_visible_down();
+        } else {
+            self.selected -= 1;
+            self.keep_selected_visible_up();
+        }
     }
 
     fn expand_selected(&mut self) {
@@ -2484,6 +2497,10 @@ fn mark_busy_panes(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
         .iter()
         .map(|process| (process.pid, process.commandline.clone()))
         .collect();
+    let process_by_pid: BTreeMap<u32, &ProcessInfo> = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
     let mut children_by_parent: BTreeMap<u32, Vec<&ProcessInfo>> = BTreeMap::new();
     for process in processes {
         children_by_parent
@@ -2499,7 +2516,7 @@ fn mark_busy_panes(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
         if let Some(commandline) = pane_active_commandline(pane, &children_by_parent) {
             pane.pane_commandline = commandline;
         }
-        pane.busy_duration_secs = pane_busy_duration(pane, &children_by_parent);
+        pane.busy_duration_secs = pane_busy_duration(pane, &process_by_pid, &children_by_parent);
     }
 }
 
@@ -2533,14 +2550,17 @@ fn pane_active_commandline(
 
 fn pane_busy_duration(
     pane: &PaneInfo,
+    process_by_pid: &BTreeMap<u32, &ProcessInfo>,
     children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
 ) -> Option<u64> {
     if pane.pane_pid == 0 {
-        return (!is_shell_command(&pane.pane_current_command)).then_some(0);
+        return None;
     }
 
-    if !is_shell_command(&pane.pane_current_command) {
-        return Some(0);
+    if let Some(process) = process_by_pid.get(&pane.pane_pid) {
+        if !is_shell_command(&process.command) {
+            return Some(process.elapsed_secs);
+        }
     }
 
     let mut max_elapsed = None;
@@ -3460,8 +3480,28 @@ host t1
                 .or_default()
                 .push(process);
         }
+        let process_by_pid: BTreeMap<u32, &ProcessInfo> = processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
 
-        assert_eq!(pane_busy_duration(&pane, &children_by_parent), Some(3723));
+        assert_eq!(
+            pane_busy_duration(&pane, &process_by_pid, &children_by_parent),
+            Some(3723)
+        );
+    }
+
+    #[test]
+    fn pane_busy_ignores_unconfirmed_transient_command() {
+        let mut pane = test_pane();
+        pane.pane_current_command = "tmux".to_string();
+        let process_by_pid = BTreeMap::new();
+        let children_by_parent = BTreeMap::new();
+
+        assert_eq!(
+            pane_busy_duration(&pane, &process_by_pid, &children_by_parent),
+            None
+        );
     }
 
     #[test]
@@ -3513,6 +3553,19 @@ host t1
         app.page_up(3);
         assert_eq!(app.selected, 2);
         assert_eq!(app.scroll_offset, 2);
+    }
+
+    #[test]
+    fn arrow_navigation_wraps_at_tree_edges() {
+        let mut app = test_app_with_rows(10);
+        app.viewport_height = 5;
+
+        app.select_previous();
+        assert_eq!(app.selected, 9);
+
+        app.select_next();
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
