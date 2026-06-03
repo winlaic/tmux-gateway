@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 use crate::app::SearchDirection;
 use crate::config::LineFormats;
-use crate::model::{HostTree, NodeId, PaneInfo, RowStatus, VisibleRow};
+use crate::model::{GpuBadge, HostTree, NodeId, PaneInfo, RowStatus, VisibleRow};
 
 pub(crate) fn build_rows(
     trees: &[HostTree],
@@ -31,6 +31,7 @@ pub(crate) fn build_rows(
             busy_duration_secs: (!expanded.contains(&host_id))
                 .then(|| max_busy_duration(tree.panes.iter()))
                 .flatten(),
+            gpu_badges: server_gpu_badges(tree),
         });
 
         if !expanded.contains(&host_id) {
@@ -59,6 +60,7 @@ pub(crate) fn build_rows(
                 busy_duration_secs: (!expanded.contains(&session_id))
                     .then(|| max_busy_duration(windows.values().flatten().copied()))
                     .flatten(),
+                gpu_badges: process_gpu_badges(&tree.gpus, windows.values().flatten().copied()),
             });
 
             if !expanded.contains(&session_id) {
@@ -90,6 +92,7 @@ pub(crate) fn build_rows(
                     busy_duration_secs: (!expanded.contains(&window_id))
                         .then(|| max_busy_duration(panes.iter().copied()))
                         .flatten(),
+                    gpu_badges: process_gpu_badges(&tree.gpus, panes.iter().copied()),
                 });
 
                 if !expanded.contains(&window_id) {
@@ -125,6 +128,7 @@ pub(crate) fn build_rows(
                         expandable: false,
                         status: RowStatus::Normal,
                         busy_duration_secs: pane.busy_duration_secs,
+                        gpu_badges: process_gpu_badges(&tree.gpus, std::iter::once(pane)),
                     });
                 }
             }
@@ -328,6 +332,82 @@ pub(crate) fn group_tree(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, V
 
 pub(crate) fn max_busy_duration<'a>(panes: impl Iterator<Item = &'a PaneInfo>) -> Option<u64> {
     panes.filter_map(|pane| pane.busy_duration_secs).max()
+}
+
+fn server_gpu_badges(tree: &HostTree) -> Vec<GpuBadge> {
+    let active_indices = active_gpu_indices(tree.panes.iter());
+    tree.gpus
+        .iter()
+        .map(|gpu| {
+            let decile = rounded_memory_decile(gpu.memory_used_mib, gpu.memory_total_mib);
+            GpuBadge::Memory {
+                digit: decile_digit(decile as u8),
+                level: decile_level(decile as u8),
+                active: active_indices.contains(&gpu.index),
+            }
+        })
+        .collect()
+}
+
+fn process_gpu_badges<'a>(
+    gpus: &[crate::model::GpuInfo],
+    panes: impl Iterator<Item = &'a PaneInfo>,
+) -> Vec<GpuBadge> {
+    let mut memory_by_index: BTreeMap<usize, u64> = BTreeMap::new();
+    for pane in panes {
+        for (index, memory_used_mib) in &pane.gpu_memory_by_index {
+            *memory_by_index.entry(*index).or_default() += *memory_used_mib;
+        }
+    }
+    if memory_by_index.is_empty() {
+        return Vec::new();
+    }
+
+    let total_by_index: BTreeMap<usize, u64> = gpus
+        .iter()
+        .map(|gpu| (gpu.index, gpu.memory_total_mib))
+        .collect();
+    memory_by_index
+        .into_iter()
+        .filter_map(|(index, memory_used_mib)| {
+            let decile = rounded_memory_decile(memory_used_mib, *total_by_index.get(&index)?);
+            Some(GpuBadge::Memory {
+                digit: decile_digit(decile),
+                level: decile_level(decile),
+                active: true,
+            })
+        })
+        .collect()
+}
+
+fn active_gpu_indices<'a>(panes: impl Iterator<Item = &'a PaneInfo>) -> BTreeSet<usize> {
+    panes
+        .flat_map(|pane| pane.gpu_indices.iter().copied())
+        .collect()
+}
+
+fn rounded_memory_decile(memory_used_mib: u64, memory_total_mib: u64) -> u8 {
+    if memory_total_mib == 0 {
+        return 0;
+    }
+
+    ((memory_used_mib.saturating_mul(100) / memory_total_mib + 5) / 10).min(10) as u8
+}
+
+fn decile_digit(decile: u8) -> char {
+    match decile.min(10) {
+        10 => 'A',
+        value => char::from(b'0' + value),
+    }
+}
+
+fn decile_level(decile: u8) -> u8 {
+    match decile.min(10) {
+        0..=2 => 0,
+        3..=5 => 1,
+        6..=8 => 2,
+        _ => 3,
+    }
 }
 
 fn human_duration(seconds: u64) -> String {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::mpsc;
 
@@ -7,7 +7,12 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::model::{HostTree, PaneInfo, ProcessInfo};
+use crate::model::{GpuInfo, GpuProcessInfo, HostTree, HostUpdate, PaneInfo, ProcessInfo};
+
+struct PaneSnapshot {
+    panes: Vec<PaneInfo>,
+    processes: Vec<ProcessInfo>,
+}
 
 pub(crate) fn collect_hosts(config: &Config) -> Vec<HostTree> {
     let pool = ThreadPoolBuilder::new()
@@ -19,21 +24,21 @@ pub(crate) fn collect_hosts(config: &Config) -> Vec<HostTree> {
             config
                 .hosts
                 .par_iter()
-                .map(|host| collect_host(host, config.connect_timeout_secs))
+                .map(|host| collect_host_snapshot(host, config.connect_timeout_secs))
                 .collect()
         }),
         Err(_) => config
             .hosts
             .iter()
-            .map(|host| collect_host(host, config.connect_timeout_secs))
+            .map(|host| collect_host_snapshot(host, config.connect_timeout_secs))
             .collect(),
     }
 }
 
-pub(crate) fn collect_hosts_streaming(
+pub(crate) fn collect_pane_updates_streaming(
     config: &Config,
     hosts: &[String],
-    sender: mpsc::Sender<HostTree>,
+    sender: mpsc::Sender<HostUpdate>,
 ) {
     let pool = ThreadPoolBuilder::new()
         .num_threads(config.scan_concurrency)
@@ -42,31 +47,97 @@ pub(crate) fn collect_hosts_streaming(
     match pool {
         Ok(pool) => pool.install(|| {
             hosts.par_iter().for_each(|host| {
-                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+                let _ = sender.send(collect_pane_update(host, config.connect_timeout_secs));
             });
         }),
         Err(_) => {
             for host in hosts {
-                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+                let _ = sender.send(collect_pane_update(host, config.connect_timeout_secs));
             }
         }
     }
 }
 
-fn collect_host(host: &str, connect_timeout_secs: u64) -> HostTree {
+pub(crate) fn collect_gpu_updates_streaming(
+    config: &Config,
+    hosts: &[String],
+    sender: mpsc::Sender<HostUpdate>,
+) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config.scan_concurrency)
+        .build();
+
+    match pool {
+        Ok(pool) => pool.install(|| {
+            hosts.par_iter().for_each(|host| {
+                let _ = sender.send(collect_gpu_update(host, config.connect_timeout_secs));
+            });
+        }),
+        Err(_) => {
+            for host in hosts {
+                let _ = sender.send(collect_gpu_update(host, config.connect_timeout_secs));
+            }
+        }
+    }
+}
+
+fn collect_host_snapshot(host: &str, connect_timeout_secs: u64) -> HostTree {
     match list_remote_panes(host, connect_timeout_secs) {
-        Ok(panes) => HostTree {
-            host: host.to_string(),
-            panes,
-            error: None,
-            connecting: false,
-        },
+        Ok(snapshot) => {
+            let (gpus, gpu_processes) =
+                collect_remote_gpus(host, connect_timeout_secs).unwrap_or_default();
+            let mut tree = HostTree {
+                host: host.to_string(),
+                panes: snapshot.panes,
+                processes: snapshot.processes,
+                gpus,
+                gpu_processes,
+                error: None,
+                connecting: false,
+            };
+            mark_pane_gpu_indices(
+                &mut tree.panes,
+                &tree.processes,
+                &tree.gpus,
+                &tree.gpu_processes,
+            );
+            tree
+        }
         Err(err) => HostTree {
             host: host.to_string(),
             panes: Vec::new(),
+            processes: Vec::new(),
+            gpus: Vec::new(),
+            gpu_processes: Vec::new(),
             error: Some(err.to_string()),
             connecting: false,
         },
+    }
+}
+
+fn collect_pane_update(host: &str, connect_timeout_secs: u64) -> HostUpdate {
+    match list_remote_panes(host, connect_timeout_secs) {
+        Ok(snapshot) => HostUpdate::Panes {
+            host: host.to_string(),
+            panes: snapshot.panes,
+            processes: snapshot.processes,
+            error: None,
+        },
+        Err(err) => HostUpdate::Panes {
+            host: host.to_string(),
+            panes: Vec::new(),
+            processes: Vec::new(),
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn collect_gpu_update(host: &str, connect_timeout_secs: u64) -> HostUpdate {
+    let (gpus, gpu_processes) = collect_remote_gpus(host, connect_timeout_secs).unwrap_or_default();
+    HostUpdate::Gpus {
+        host: host.to_string(),
+        gpus,
+        gpu_processes,
     }
 }
 
@@ -79,7 +150,7 @@ pub(crate) fn sort_trees_by_config(trees: &mut [HostTree], hosts: &[String]) {
     trees.sort_by_key(|tree| order.get(tree.host.as_str()).copied().unwrap_or(usize::MAX));
 }
 
-fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneInfo>> {
+fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<PaneSnapshot> {
     let format = [
         "#{session_name}",
         "#{session_id}",
@@ -111,7 +182,10 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneIn
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.contains("no server running") || stderr.contains("No such file or directory") {
-            return Ok(Vec::new());
+            return Ok(PaneSnapshot {
+                panes: Vec::new(),
+                processes: Vec::new(),
+            });
         }
         bail!(
             "ssh/tmux command failed for host {host}: {}",
@@ -129,7 +203,7 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneIn
         .with_context(|| format!("failed to parse tmux panes from host {host}"))
 }
 
-pub(crate) fn parse_remote_snapshot(output: &str) -> Result<Vec<PaneInfo>> {
+fn parse_remote_snapshot(output: &str) -> Result<PaneSnapshot> {
     let mut pane_lines = Vec::new();
     let mut process_lines = Vec::new();
     let mut section = "";
@@ -157,7 +231,7 @@ pub(crate) fn parse_remote_snapshot(output: &str) -> Result<Vec<PaneInfo>> {
     let mut panes = parse_panes(&pane_lines.join("\n"))?;
     let processes = parse_processes(&process_lines.join("\n"));
     mark_busy_panes(&mut panes, &processes);
-    Ok(panes)
+    Ok(PaneSnapshot { panes, processes })
 }
 
 pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
@@ -188,10 +262,113 @@ pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
             active_window: fields[11] == "1",
             active_pane: fields[12] == "1",
             busy_duration_secs: None,
+            gpu_indices: Vec::new(),
+            gpu_memory_by_index: Vec::new(),
         });
     }
 
     Ok(panes)
+}
+
+fn collect_remote_gpus(
+    host: &str,
+    connect_timeout_secs: u64,
+) -> Result<(Vec<GpuInfo>, Vec<GpuProcessInfo>)> {
+    let remote_command = "printf '%s\\n' __TMUX_GATEWAY_GPUS__; nvidia-smi --query-gpu=index,uuid,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; printf '%s\\n' __TMUX_GATEWAY_GPU_PROCESSES__; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true";
+    parse_gpu_snapshot(&run_remote_optional(
+        host,
+        connect_timeout_secs,
+        remote_command,
+    )?)
+}
+
+fn run_remote_optional(
+    host: &str,
+    connect_timeout_secs: u64,
+    remote_command: &str,
+) -> Result<String> {
+    let output = Command::new("ssh")
+        .args(ssh_options(connect_timeout_secs))
+        .arg(host)
+        .arg(remote_command)
+        .output()
+        .with_context(|| format!("failed to start ssh for host {host}"))?;
+
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("nvidia-smi output from host {host} was not utf-8"))
+}
+
+pub(crate) fn parse_gpus(output: &str) -> Vec<GpuInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() < 4 {
+                return None;
+            }
+            Some(GpuInfo {
+                index: fields[0].parse().ok()?,
+                uuid: fields[1].to_string(),
+                memory_used_mib: fields[2].parse().ok()?,
+                memory_total_mib: fields[3].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn parse_gpu_processes(output: &str) -> Vec<GpuProcessInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() < 2 {
+                return None;
+            }
+            Some(GpuProcessInfo {
+                gpu_uuid: fields[0].to_string(),
+                pid: fields[1].parse().ok()?,
+                used_memory_mib: fields
+                    .get(2)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn parse_gpu_snapshot(output: &str) -> Result<(Vec<GpuInfo>, Vec<GpuProcessInfo>)> {
+    let mut gpu_lines = Vec::new();
+    let mut process_lines = Vec::new();
+    let mut section = "";
+
+    for line in output.lines() {
+        match line {
+            "__TMUX_GATEWAY_GPUS__" => {
+                section = "gpus";
+                continue;
+            }
+            "__TMUX_GATEWAY_GPU_PROCESSES__" => {
+                section = "processes";
+                continue;
+            }
+            _ => {}
+        }
+
+        match section {
+            "gpus" => gpu_lines.push(line),
+            "processes" => process_lines.push(line),
+            _ => {}
+        }
+    }
+
+    Ok((
+        parse_gpus(&gpu_lines.join("\n")),
+        parse_gpu_processes(&process_lines.join("\n")),
+    ))
 }
 
 fn parse_processes(output: &str) -> Vec<ProcessInfo> {
@@ -241,6 +418,60 @@ fn mark_busy_panes(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
         }
         pane.busy_duration_secs = pane_busy_duration(pane, &process_by_pid, &children_by_parent);
     }
+}
+
+pub(crate) fn mark_pane_gpu_indices(
+    panes: &mut [PaneInfo],
+    processes: &[ProcessInfo],
+    gpus: &[GpuInfo],
+    gpu_processes: &[GpuProcessInfo],
+) {
+    let gpu_index_by_uuid: BTreeMap<&str, usize> = gpus
+        .iter()
+        .map(|gpu| (gpu.uuid.as_str(), gpu.index))
+        .collect();
+    let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for process in processes {
+        children_by_parent
+            .entry(process.ppid)
+            .or_default()
+            .push(process.pid);
+    }
+
+    for pane in panes {
+        let process_tree = pane_process_tree(pane.pane_pid, &children_by_parent);
+        let mut memory_by_index: BTreeMap<usize, u64> = BTreeMap::new();
+        for gpu_process in gpu_processes
+            .iter()
+            .filter(|gpu_process| process_tree.contains(&gpu_process.pid))
+        {
+            let Some(index) = gpu_index_by_uuid.get(gpu_process.gpu_uuid.as_str()) else {
+                continue;
+            };
+            *memory_by_index.entry(*index).or_default() += gpu_process.used_memory_mib;
+        }
+        pane.gpu_indices = memory_by_index.keys().copied().collect();
+        pane.gpu_memory_by_index = memory_by_index.into_iter().collect();
+    }
+}
+
+fn pane_process_tree(root_pid: u32, children_by_parent: &BTreeMap<u32, Vec<u32>>) -> BTreeSet<u32> {
+    let mut process_tree = BTreeSet::new();
+    if root_pid == 0 {
+        return process_tree;
+    }
+
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        if !process_tree.insert(pid) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    process_tree
 }
 
 fn pane_active_commandline(

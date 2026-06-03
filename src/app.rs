@@ -11,8 +11,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::config::{Config, ExpandLevel};
-use crate::model::{HostTree, NodeId, VisibleRow};
-use crate::remote::{collect_hosts_streaming, shell_quote, sort_trees_by_config, ssh_options};
+use crate::model::{HostTree, HostUpdate, NodeId, VisibleRow};
+use crate::remote::{
+    collect_gpu_updates_streaming, collect_pane_updates_streaming, mark_pane_gpu_indices,
+    shell_quote, sort_trees_by_config, ssh_options,
+};
 use crate::tree::{
     SearchStart, build_rows, expandable_node_ids, group_tree, parent_id, search_rows,
 };
@@ -23,6 +26,7 @@ use crate::ui::{
 const DEFAULT_STATUS: &str =
     "Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
 const STATUS_TTL: Duration = Duration::from_secs(3);
+const GPU_SCAN_START_DELAY: Duration = Duration::from_millis(750);
 
 pub(crate) struct App {
     pub(crate) config: Config,
@@ -54,7 +58,7 @@ pub(crate) enum RefreshRequest {
 
 pub(crate) struct ScanTask {
     config: Config,
-    receiver: Option<Receiver<HostTree>>,
+    receiver: Option<Receiver<HostUpdate>>,
     pending: usize,
 }
 
@@ -84,34 +88,41 @@ impl ScanTask {
         }
 
         let (sender, receiver) = mpsc::channel();
-        self.pending = hosts.len();
+        self.pending = hosts.len() * 2;
         self.receiver = Some(receiver);
         let config = self.config.clone();
-        thread::spawn(move || collect_hosts_streaming(&config, &hosts, sender));
+        let gpu_config = config.clone();
+        let gpu_hosts = hosts.clone();
+        let gpu_sender = sender.clone();
+        thread::spawn(move || collect_pane_updates_streaming(&config, &hosts, sender));
+        thread::spawn(move || {
+            thread::sleep(GPU_SCAN_START_DELAY);
+            collect_gpu_updates_streaming(&gpu_config, &gpu_hosts, gpu_sender);
+        });
     }
 
-    pub(crate) fn drain(&mut self) -> Vec<HostTree> {
-        let mut trees = Vec::new();
+    pub(crate) fn drain(&mut self) -> Vec<HostUpdate> {
+        let mut updates = Vec::new();
         let Some(receiver) = self.receiver.take() else {
-            return trees;
+            return updates;
         };
 
         loop {
             match receiver.try_recv() {
-                Ok(tree) => {
+                Ok(update) => {
                     self.pending = self.pending.saturating_sub(1);
-                    trees.push(tree);
+                    updates.push(update);
                     if self.pending == 0 {
-                        return trees;
+                        return updates;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     self.receiver = Some(receiver);
-                    return trees;
+                    return updates;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = 0;
-                    return trees;
+                    return updates;
                 }
             }
         }
@@ -329,6 +340,9 @@ impl App {
             .map(|host| HostTree {
                 host: host.clone(),
                 panes: Vec::new(),
+                processes: Vec::new(),
+                gpus: Vec::new(),
+                gpu_processes: Vec::new(),
                 error: None,
                 connecting: true,
             })
@@ -337,21 +351,68 @@ impl App {
         self.set_status(DEFAULT_STATUS);
     }
 
-    pub(crate) fn apply_scan_results(&mut self, trees: Vec<HostTree>) {
-        if trees.is_empty() {
+    pub(crate) fn apply_scan_results(&mut self, updates: Vec<HostUpdate>) {
+        if updates.is_empty() {
             return;
         }
 
-        for tree in trees {
-            if let Some(existing) = self.trees.iter_mut().find(|item| item.host == tree.host) {
-                *existing = tree;
-            } else {
-                self.trees.push(tree);
+        for update in updates {
+            match update {
+                HostUpdate::Panes {
+                    host,
+                    panes,
+                    processes,
+                    error,
+                } => {
+                    let tree = self.ensure_tree(&host);
+                    tree.panes = panes;
+                    tree.processes = processes;
+                    tree.error = error;
+                    tree.connecting = false;
+                    mark_pane_gpu_indices(
+                        &mut tree.panes,
+                        &tree.processes,
+                        &tree.gpus,
+                        &tree.gpu_processes,
+                    );
+                }
+                HostUpdate::Gpus {
+                    host,
+                    gpus,
+                    gpu_processes,
+                } => {
+                    let tree = self.ensure_tree(&host);
+                    tree.gpus = gpus;
+                    tree.gpu_processes = gpu_processes;
+                    mark_pane_gpu_indices(
+                        &mut tree.panes,
+                        &tree.processes,
+                        &tree.gpus,
+                        &tree.gpu_processes,
+                    );
+                }
             }
         }
         sort_trees_by_config(&mut self.trees, &self.config.hosts);
         self.apply_trees_after_refresh();
         self.apply_search_from_current();
+    }
+
+    fn ensure_tree(&mut self, host: &str) -> &mut HostTree {
+        if let Some(index) = self.trees.iter().position(|tree| tree.host == host) {
+            return &mut self.trees[index];
+        }
+
+        self.trees.push(HostTree {
+            host: host.to_string(),
+            panes: Vec::new(),
+            processes: Vec::new(),
+            gpus: Vec::new(),
+            gpu_processes: Vec::new(),
+            error: None,
+            connecting: true,
+        });
+        self.trees.last_mut().expect("tree was just pushed")
     }
 
     pub(crate) fn apply_trees_after_refresh(&mut self) {

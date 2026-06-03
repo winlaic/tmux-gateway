@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, ContextMenuItem, ContextMenuState, Mode, SplitChoice, prompt_help};
-use crate::model::RowStatus;
+#[cfg(test)]
+use crate::model::NodeId;
+use crate::model::{GpuBadge, RowStatus, VisibleRow};
 
 pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -93,16 +95,18 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 Style::default()
             };
             let cursor = if selected { "➜ " } else { "  " };
-            let detail = row.detail.clone();
-            ListItem::new(Line::from(vec![
-                Span::styled(cursor, row_style),
-                Span::raw(indent),
-                Span::styled(marker, Style::default().fg(Color::Yellow)),
-                Span::raw(" "),
-                Span::styled(row.label.clone(), main_style),
-                Span::raw(" "),
-                Span::styled(detail, detail_style),
-            ]))
+            ListItem::new(row_line(
+                row,
+                RowRenderParts {
+                    cursor,
+                    indent,
+                    marker,
+                    row_style,
+                    main_style,
+                    detail_style,
+                    width: chunks[1].width.saturating_sub(2),
+                },
+            ))
             .style(row_style)
         })
         .collect();
@@ -126,6 +130,152 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[2]);
 
     draw_modal(frame, app);
+}
+
+struct RowRenderParts {
+    cursor: &'static str,
+    indent: String,
+    marker: &'static str,
+    row_style: Style,
+    main_style: Style,
+    detail_style: Style,
+    width: u16,
+}
+
+fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
+    if row.gpu_badges.is_empty() {
+        return Line::from(vec![
+            Span::styled(parts.cursor, parts.row_style),
+            Span::raw(parts.indent),
+            Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled(row.label.clone(), parts.main_style),
+            Span::raw(" "),
+            Span::styled(row.detail.clone(), parts.detail_style),
+        ]);
+    }
+
+    let fixed_width = parts.cursor.chars().count() as u16
+        + parts.indent.chars().count() as u16
+        + parts.marker.chars().count() as u16
+        + 2;
+    let badge_width = row.gpu_badges.len() as u16;
+    let badge_gap = if badge_width > 0 { 1 } else { 0 };
+    let text_width = parts
+        .width
+        .saturating_sub(fixed_width)
+        .saturating_sub(badge_width)
+        .saturating_sub(badge_gap);
+    let (label, detail) = trim_row_text(&row.label, &row.detail, text_width);
+
+    let mut spans = vec![
+        Span::styled(parts.cursor, parts.row_style),
+        Span::raw(parts.indent),
+        Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled(label.clone(), parts.main_style),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(detail.clone(), parts.detail_style));
+    }
+
+    add_right_aligned_gpu_badges(&mut spans, row, parts.width, fixed_width + text_width);
+    Line::from(spans)
+}
+
+fn add_right_aligned_gpu_badges(
+    spans: &mut Vec<Span<'static>>,
+    row: &VisibleRow,
+    width: u16,
+    reserved_left_width: u16,
+) {
+    if row.gpu_badges.is_empty() || width == 0 {
+        return;
+    }
+
+    let badge_width = row.gpu_badges.len() as u16;
+    let actual_left_width = line_width(spans);
+    let left_width = actual_left_width.min(reserved_left_width);
+    let gap = width.saturating_sub(left_width).saturating_sub(badge_width);
+    spans.push(Span::raw(" ".repeat(gap as usize)));
+    spans.extend(row.gpu_badges.iter().map(gpu_badge_span));
+}
+
+fn trim_row_text(label: &str, detail: &str, width: u16) -> (String, String) {
+    if width == 0 {
+        return (String::new(), String::new());
+    }
+
+    let label_width = label.chars().count() as u16;
+    if detail.is_empty() || label_width >= width {
+        return (trim_to_width(label, width), String::new());
+    }
+
+    let detail_width = width.saturating_sub(label_width).saturating_sub(1);
+    (label.to_string(), trim_to_width(detail, detail_width))
+}
+
+fn trim_to_width(value: &str, width: u16) -> String {
+    value.chars().take(width as usize).collect()
+}
+
+fn line_width(spans: &[Span<'_>]) -> u16 {
+    spans
+        .iter()
+        .map(|span| span.content.chars().count() as u16)
+        .sum()
+}
+
+fn gpu_badge_span(badge: &GpuBadge) -> Span<'static> {
+    match badge {
+        GpuBadge::Memory {
+            digit,
+            level,
+            active,
+        } => Span::styled(
+            digit.to_string(),
+            Style::default()
+                .fg(gpu_badge_foreground(*active))
+                .bg(if *active {
+                    Color::Blue
+                } else {
+                    gpu_memory_color(*level)
+                }),
+        ),
+    }
+}
+
+fn gpu_memory_color(level: u8) -> Color {
+    match level {
+        0 => Color::Green,
+        1 => Color::Yellow,
+        2 => Color::Rgb(255, 165, 0),
+        _ => Color::Red,
+    }
+}
+
+fn gpu_badge_foreground(active: bool) -> Color {
+    if active { Color::White } else { Color::Black }
+}
+
+#[cfg(test)]
+pub(crate) fn test_render_row_line(row: &VisibleRow, width: u16) -> Line<'static> {
+    row_line(
+        row,
+        RowRenderParts {
+            cursor: "  ",
+            indent: "  ".repeat(row.depth),
+            marker: match row.id {
+                NodeId::Pane { .. } => " ",
+                _ => "▸",
+            },
+            row_style: Style::default(),
+            main_style: Style::default(),
+            detail_style: Style::default(),
+            width,
+        },
+    )
 }
 
 fn draw_modal(frame: &mut ratatui::Frame<'_>, app: &App) {

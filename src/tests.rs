@@ -12,12 +12,17 @@ use crate::config::{
     DEFAULT_WINDOW_LINE_TEXT, ExpandLevel, LineFormats, RawConfig, load_config, normalize_config,
     parse_ssh_config_hosts,
 };
-use crate::model::{HostTree, NodeId, PaneInfo, ProcessInfo, RowStatus, VisibleRow};
-use crate::remote::{pane_busy_duration, parse_panes, shell_quote};
+use crate::model::{
+    GpuBadge, GpuInfo, HostTree, HostUpdate, NodeId, PaneInfo, ProcessInfo, RowStatus, VisibleRow,
+};
+use crate::remote::{
+    mark_pane_gpu_indices, pane_busy_duration, parse_gpu_processes, parse_gpu_snapshot, parse_gpus,
+    parse_panes, shell_quote,
+};
 use crate::tree::{SearchStart, build_rows, expanded_all, format_line, host_detail, search_rows};
 use crate::ui::{
     confirm_area, confirm_choice_at_mouse, context_menu_area, split_choice_area,
-    split_choice_at_mouse,
+    split_choice_at_mouse, test_render_row_line,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -299,6 +304,9 @@ fn empty_host_is_not_expandable() {
     let tree = HostTree {
         host: "empty".to_string(),
         panes: Vec::new(),
+        processes: Vec::new(),
+        gpus: Vec::new(),
+        gpu_processes: Vec::new(),
         error: None,
         connecting: false,
     };
@@ -323,12 +331,12 @@ fn refreshed_empty_node_loses_previous_expand_state() {
     assert!(!app.default_expand_pending);
 
     tree.panes.clear();
-    app.apply_scan_results(vec![tree.clone()]);
+    app.apply_scan_results(vec![pane_update_from_tree(&tree)]);
     assert!(!app.expanded.contains(&host_id));
     assert!(!app.rows[0].expandable);
 
     tree.panes.push(test_pane());
-    app.apply_scan_results(vec![tree]);
+    app.apply_scan_results(vec![pane_update_from_tree(&tree)]);
     assert!(!app.expanded.contains(&host_id));
     assert!(app.rows[0].expandable);
     assert_eq!(app.rows.len(), 1);
@@ -639,6 +647,275 @@ fn pane_current_path_placeholder_is_available() {
 }
 
 #[test]
+fn gpu_parsing_and_pane_matching_marks_only_owned_gpus() {
+    let gpus = parse_gpus(
+        "0, GPU-a, 1024, 8192\n\
+         1, GPU-b, 7800, 8192\n",
+    );
+    let gpu_processes = parse_gpu_processes("GPU-a, 201, 512\nGPU-b, 999, 4096\n");
+    let mut panes = vec![test_pane()];
+    let processes = vec![
+        ProcessInfo {
+            pid: 123,
+            ppid: 1,
+            elapsed_secs: 10,
+            command: "pwsh".to_string(),
+            commandline: "pwsh".to_string(),
+        },
+        ProcessInfo {
+            pid: 201,
+            ppid: 123,
+            elapsed_secs: 10,
+            command: "python".to_string(),
+            commandline: "python train.py".to_string(),
+        },
+    ];
+
+    mark_pane_gpu_indices(&mut panes, &processes, &gpus, &gpu_processes);
+
+    assert_eq!(panes[0].gpu_indices, vec![0]);
+    assert_eq!(panes[0].gpu_memory_by_index, vec![(0, 512)]);
+}
+
+#[test]
+fn parse_gpu_snapshot_splits_gpu_and_process_sections() {
+    let output = "__TMUX_GATEWAY_GPUS__\n\
+                  0, GPU-a, 1024, 8192\n\
+                  __TMUX_GATEWAY_GPU_PROCESSES__\n\
+                  GPU-a, 201, 512\n";
+
+    let (gpus, gpu_processes) = parse_gpu_snapshot(output).unwrap();
+
+    assert_eq!(gpus.len(), 1);
+    assert_eq!(gpus[0].uuid, "GPU-a");
+    assert_eq!(gpu_processes.len(), 1);
+    assert_eq!(gpu_processes[0].pid, 201);
+    assert_eq!(gpu_processes[0].used_memory_mib, 512);
+}
+
+#[test]
+fn gpu_badges_roll_up_from_pane_to_window_session_and_server() {
+    let mut tree = test_host_tree("t2");
+    tree.gpus = vec![
+        GpuInfo {
+            index: 0,
+            uuid: "GPU-a".to_string(),
+            memory_used_mib: 1024,
+            memory_total_mib: 8192,
+        },
+        GpuInfo {
+            index: 1,
+            uuid: "GPU-b".to_string(),
+            memory_used_mib: 7800,
+            memory_total_mib: 8192,
+        },
+    ];
+    tree.panes[0].gpu_indices = vec![1];
+    tree.panes[0].gpu_memory_by_index = vec![(1, 2048)];
+    let rows = build_rows(
+        &[tree.clone()],
+        &expanded_all(&[tree]),
+        &test_line_formats(),
+    );
+
+    let host = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Host(_)))
+        .unwrap();
+    assert_eq!(
+        host.gpu_badges,
+        vec![
+            GpuBadge::Memory {
+                digit: '1',
+                level: 0,
+                active: false,
+            },
+            GpuBadge::Memory {
+                digit: 'A',
+                level: 3,
+                active: true,
+            },
+        ]
+    );
+
+    let window = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Window { .. }))
+        .unwrap();
+    assert_eq!(
+        window.gpu_badges,
+        vec![GpuBadge::Memory {
+            digit: '3',
+            level: 1,
+            active: true,
+        }]
+    );
+}
+
+#[test]
+fn child_gpu_badges_are_hidden_without_gpu_processes() {
+    let mut tree = test_host_tree("t2");
+    tree.gpus = vec![GpuInfo {
+        index: 0,
+        uuid: "GPU-a".to_string(),
+        memory_used_mib: 4000,
+        memory_total_mib: 8000,
+    }];
+    let rows = build_rows(
+        &[tree.clone()],
+        &expanded_all(&[tree]),
+        &test_line_formats(),
+    );
+
+    assert!(
+        rows.iter()
+            .find(|row| matches!(row.id, NodeId::Host(_)))
+            .unwrap()
+            .gpu_badges
+            .len()
+            == 1
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| !matches!(row.id, NodeId::Host(_)))
+            .all(|row| row.gpu_badges.is_empty())
+    );
+}
+
+#[test]
+fn child_gpu_badges_sum_memory_from_child_panes() {
+    let mut tree = test_host_tree("t2");
+    tree.gpus = vec![GpuInfo {
+        index: 0,
+        uuid: "GPU-a".to_string(),
+        memory_used_mib: 4096,
+        memory_total_mib: 8192,
+    }];
+    tree.panes[0].gpu_indices = vec![0];
+    tree.panes[0].gpu_memory_by_index = vec![(0, 1024)];
+    let mut second = test_pane();
+    second.pane_id = "%1".to_string();
+    second.pane_index = "1".to_string();
+    second.gpu_indices = vec![0];
+    second.gpu_memory_by_index = vec![(0, 2048)];
+    tree.panes.push(second);
+
+    let rows = build_rows(
+        &[tree.clone()],
+        &expanded_all(&[tree]),
+        &test_line_formats(),
+    );
+    let window = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Window { .. }))
+        .unwrap();
+
+    assert_eq!(
+        window.gpu_badges,
+        vec![GpuBadge::Memory {
+            digit: '4',
+            level: 1,
+            active: true,
+        }]
+    );
+}
+
+#[test]
+fn gpu_memory_badges_round_to_nearest_decile() {
+    let mut tree = test_host_tree("t2");
+    tree.gpus = vec![
+        GpuInfo {
+            index: 0,
+            uuid: "GPU-0".to_string(),
+            memory_used_mib: 49,
+            memory_total_mib: 1000,
+        },
+        GpuInfo {
+            index: 1,
+            uuid: "GPU-1".to_string(),
+            memory_used_mib: 50,
+            memory_total_mib: 1000,
+        },
+        GpuInfo {
+            index: 2,
+            uuid: "GPU-2".to_string(),
+            memory_used_mib: 949,
+            memory_total_mib: 1000,
+        },
+        GpuInfo {
+            index: 3,
+            uuid: "GPU-3".to_string(),
+            memory_used_mib: 950,
+            memory_total_mib: 1000,
+        },
+    ];
+    let rows = build_rows(&[tree], &BTreeSet::new(), &test_line_formats());
+
+    assert_eq!(
+        rows[0].gpu_badges,
+        vec![
+            GpuBadge::Memory {
+                digit: '0',
+                level: 0,
+                active: false,
+            },
+            GpuBadge::Memory {
+                digit: '1',
+                level: 0,
+                active: false,
+            },
+            GpuBadge::Memory {
+                digit: '9',
+                level: 3,
+                active: false,
+            },
+            GpuBadge::Memory {
+                digit: 'A',
+                level: 3,
+                active: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn gpu_badges_keep_right_edge_when_row_text_is_long() {
+    let mut row = test_row("very-long-command-line-that-would-overflow-the-row");
+    row.gpu_badges = vec![
+        GpuBadge::Memory {
+            digit: '0',
+            level: 0,
+            active: true,
+        },
+        GpuBadge::Memory {
+            digit: '1',
+            level: 0,
+            active: true,
+        },
+    ];
+
+    let line = test_render_row_line(&row, 20);
+
+    assert_eq!(line_width(&line), 20);
+    assert_eq!(line.spans[line.spans.len() - 2].content.as_ref(), "0");
+    assert_eq!(line.spans[line.spans.len() - 1].content.as_ref(), "1");
+}
+
+#[test]
+fn rows_without_gpu_badges_keep_original_untrimmed_text() {
+    let row = test_row("very-long-command-line-that-would-overflow-the-row");
+
+    let line = test_render_row_line(&row, 20);
+    let rendered = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert!(rendered.contains("very-long-command-line-that-would-overflow-the-row"));
+}
+
+#[test]
 fn app_starts_with_connecting_placeholders() {
     let app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
 
@@ -651,7 +928,7 @@ fn app_starts_with_connecting_placeholders() {
 fn scan_results_replace_single_connecting_host() {
     let mut app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
 
-    app.apply_scan_results(vec![test_host_tree("t2")]);
+    app.apply_scan_results(vec![pane_update_from_tree(&test_host_tree("t2"))]);
 
     assert!(
         app.trees
@@ -666,10 +943,37 @@ fn scan_results_replace_single_connecting_host() {
 }
 
 #[test]
+fn scan_task_accepts_pane_and_gpu_updates_independently() {
+    let mut app = test_app_with_hosts(vec!["t2".to_string()]);
+
+    app.apply_scan_results(vec![pane_update_from_tree(&test_host_tree("t2"))]);
+    let t2 = app.trees.iter().find(|tree| tree.host == "t2").unwrap();
+    assert_eq!(t2.panes.len(), 1);
+    assert!(t2.gpus.is_empty());
+
+    app.apply_scan_results(vec![HostUpdate::Gpus {
+        host: "t2".to_string(),
+        gpus: vec![GpuInfo {
+            index: 0,
+            uuid: "GPU-a".to_string(),
+            memory_used_mib: 50,
+            memory_total_mib: 100,
+        }],
+        gpu_processes: Vec::new(),
+    }]);
+    let t2 = app.trees.iter().find(|tree| tree.host == "t2").unwrap();
+    assert_eq!(t2.panes.len(), 1);
+    assert_eq!(t2.gpus.len(), 1);
+}
+
+#[test]
 fn host_detail_is_empty_when_tmux_is_not_running() {
     let tree = HostTree {
         host: "t2".to_string(),
         panes: Vec::new(),
+        processes: Vec::new(),
+        gpus: Vec::new(),
+        gpu_processes: Vec::new(),
         error: None,
         connecting: false,
     };
@@ -685,6 +989,9 @@ fn unavailable_host_row_is_marked_for_error_styling() {
     let tree = HostTree {
         host: "t2".to_string(),
         panes: Vec::new(),
+        processes: Vec::new(),
+        gpus: Vec::new(),
+        gpu_processes: Vec::new(),
         error: Some("ssh timeout".to_string()),
         connecting: false,
     };
@@ -896,8 +1203,20 @@ fn test_host_tree(host: &str) -> HostTree {
     HostTree {
         host: host.to_string(),
         panes: vec![test_pane()],
+        processes: Vec::new(),
+        gpus: Vec::new(),
+        gpu_processes: Vec::new(),
         error: None,
         connecting: false,
+    }
+}
+
+fn pane_update_from_tree(tree: &HostTree) -> HostUpdate {
+    HostUpdate::Panes {
+        host: tree.host.clone(),
+        panes: tree.panes.clone(),
+        processes: tree.processes.clone(),
+        error: tree.error.clone(),
     }
 }
 
@@ -927,6 +1246,8 @@ fn test_pane() -> PaneInfo {
         active_window: true,
         active_pane: true,
         busy_duration_secs: None,
+        gpu_indices: Vec::new(),
+        gpu_memory_by_index: Vec::new(),
     }
 }
 
@@ -954,5 +1275,13 @@ fn test_row(search_text: &str) -> VisibleRow {
         expandable: false,
         status: RowStatus::Normal,
         busy_duration_secs: None,
+        gpu_badges: Vec::new(),
     }
+}
+
+fn line_width(line: &ratatui::text::Line<'_>) -> u16 {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count() as u16)
+        .sum()
 }

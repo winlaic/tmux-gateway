@@ -15,6 +15,8 @@ pub(crate) struct PaneInfo {
     pub(crate) active_window: bool,
     pub(crate) active_pane: bool,
     pub(crate) busy_duration_secs: Option<u64>,
+    pub(crate) gpu_indices: Vec<usize>,
+    pub(crate) gpu_memory_by_index: Vec<(usize, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,11 +29,53 @@ pub(crate) struct ProcessInfo {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct GpuInfo {
+    pub(crate) index: usize,
+    pub(crate) uuid: String,
+    pub(crate) memory_used_mib: u64,
+    pub(crate) memory_total_mib: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GpuProcessInfo {
+    pub(crate) gpu_uuid: String,
+    pub(crate) pid: u32,
+    pub(crate) used_memory_mib: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GpuBadge {
+    Memory {
+        digit: char,
+        level: u8,
+        active: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct HostTree {
     pub(crate) host: String,
     pub(crate) panes: Vec<PaneInfo>,
+    pub(crate) processes: Vec<ProcessInfo>,
+    pub(crate) gpus: Vec<GpuInfo>,
+    pub(crate) gpu_processes: Vec<GpuProcessInfo>,
     pub(crate) error: Option<String>,
     pub(crate) connecting: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HostUpdate {
+    Panes {
+        host: String,
+        panes: Vec<PaneInfo>,
+        processes: Vec<ProcessInfo>,
+        error: Option<String>,
+    },
+    Gpus {
+        host: String,
+        gpus: Vec<GpuInfo>,
+        gpu_processes: Vec<GpuProcessInfo>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -65,6 +109,7 @@ pub(crate) struct VisibleRow {
     pub(crate) expandable: bool,
     pub(crate) status: RowStatus,
     pub(crate) busy_duration_secs: Option<u64>,
+    pub(crate) gpu_badges: Vec<GpuBadge>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
