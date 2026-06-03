@@ -130,6 +130,7 @@ struct PaneInfo {
     pane_pid: u32,
     pane_current_command: String,
     pane_commandline: String,
+    pane_current_path: String,
     pane_title: String,
     active_window: bool,
     active_pane: bool,
@@ -2438,6 +2439,7 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneIn
         "#{pane_id}",
         "#{pane_pid}",
         "#{pane_current_command}",
+        "#{pane_current_path}",
         "#{pane_title}",
         "#{window_active}",
         "#{pane_active}",
@@ -2512,9 +2514,9 @@ fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 12 {
+        if fields.len() != 13 {
             bail!(
-                "expected 12 tab-separated fields, got {} in line {line:?}",
+                "expected 13 tab-separated fields, got {} in line {line:?}",
                 fields.len()
             );
         }
@@ -2530,9 +2532,10 @@ fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
             pane_pid: fields[7].parse().unwrap_or(0),
             pane_current_command: fields[8].to_string(),
             pane_commandline: fields[8].to_string(),
-            pane_title: fields[9].to_string(),
-            active_window: fields[10] == "1",
-            active_pane: fields[11] == "1",
+            pane_current_path: fields[9].to_string(),
+            pane_title: fields[10].to_string(),
+            active_window: fields[11] == "1",
+            active_pane: fields[12] == "1",
             busy_duration_secs: None,
         });
     }
@@ -2910,6 +2913,7 @@ fn format_pane_line(
     values.insert("pane_current_command", pane.pane_current_command.clone());
     values.insert("pane_command", pane.pane_current_command.clone());
     values.insert("pane_commandline", pane.pane_commandline.clone());
+    values.insert("pane_current_path", pane.pane_current_path.clone());
     values.insert("pane_title", pane.pane_title.clone());
     values.insert(
         "pane_title_prefix",
@@ -3493,7 +3497,7 @@ mod tests {
 
     #[test]
     fn parse_panes_reads_tmux_format() {
-        let output = "s\t$1\t0\t@2\tzsh\t1\t%3\t123\tvim\ttitle\t1\t0\n";
+        let output = "s\t$1\t0\t@2\tzsh\t1\t%3\t123\tvim\t/tmp/project\ttitle\t1\t0\n";
         let panes = parse_panes(output).unwrap();
 
         assert_eq!(panes.len(), 1);
@@ -3501,6 +3505,7 @@ mod tests {
         assert_eq!(panes[0].session_id, "$1");
         assert_eq!(panes[0].window_id, "@2");
         assert_eq!(panes[0].pane_id, "%3");
+        assert_eq!(panes[0].pane_current_path, "/tmp/project");
         assert!(panes[0].active_window);
         assert!(!panes[0].active_pane);
     }
@@ -4087,6 +4092,20 @@ host t1
     }
 
     #[test]
+    fn pane_current_path_placeholder_is_available() {
+        let tree = test_host_tree("t2");
+        let mut formats = test_line_formats();
+        formats.pane = "{pane_current_path}".to_string();
+
+        let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+        let pane_row = rows
+            .iter()
+            .find(|row| matches!(row.id, NodeId::Pane { .. }))
+            .unwrap();
+        assert_eq!(pane_row.label, "/tmp/project");
+    }
+
+    #[test]
     fn app_starts_with_connecting_placeholders() {
         let app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
 
@@ -4370,6 +4389,7 @@ host t1
             pane_pid: 123,
             pane_current_command: "pwsh".to_string(),
             pane_commandline: "pwsh -NoLogo".to_string(),
+            pane_current_path: "/tmp/project".to_string(),
             pane_title: String::new(),
             active_window: true,
             active_pane: true,

@@ -51,6 +51,6 @@ window_line_text = "[Window] {is_active}{window_index}: {window_name}"
 # Placeholders:
 # {server_name} {host} {session_name} {window_index} {window_name}
 # {pane_index} {pane_id} {pane_pid} {pane_current_command} {pane_command}
-# {pane_commandline} {pane_title} {pane_title_prefix} {is_active}
+# {pane_commandline} {pane_current_path} {pane_title} {pane_title_prefix} {is_active}
 # {process_status} {process_elapsed_time}
 pane_line_text = "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}"
