@@ -49,6 +49,7 @@ pub(crate) enum GpuBadge {
         digit: char,
         level: u8,
         active: bool,
+        placeholder: bool,
     },
 }
 

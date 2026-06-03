@@ -233,11 +233,14 @@ fn gpu_badge_span(badge: &GpuBadge) -> Span<'static> {
             digit,
             level,
             active,
+            placeholder,
         } => Span::styled(
             digit.to_string(),
             Style::default()
                 .fg(gpu_badge_foreground(*active))
-                .bg(if *active {
+                .bg(if *placeholder {
+                    Color::DarkGray
+                } else if *active {
                     Color::Blue
                 } else {
                     gpu_memory_color(*level)

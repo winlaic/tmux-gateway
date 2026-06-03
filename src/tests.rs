@@ -712,11 +712,13 @@ fn gpu_badges_roll_up_from_pane_to_window_session_and_server() {
     ];
     tree.panes[0].gpu_indices = vec![1];
     tree.panes[0].gpu_memory_by_index = vec![(1, 2048)];
-    let rows = build_rows(
-        &[tree.clone()],
-        &expanded_all(&[tree]),
-        &test_line_formats(),
-    );
+    let mut expanded = BTreeSet::new();
+    expanded.insert(NodeId::Host("t2".to_string()));
+    expanded.insert(NodeId::Session {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+    });
+    let rows = build_rows(&[tree.clone()], &expanded, &test_line_formats());
 
     let host = rows
         .iter()
@@ -729,11 +731,13 @@ fn gpu_badges_roll_up_from_pane_to_window_session_and_server() {
                 digit: '1',
                 level: 0,
                 active: false,
+                placeholder: false,
             },
             GpuBadge::Memory {
                 digit: 'A',
                 level: 3,
                 active: true,
+                placeholder: false,
             },
         ]
     );
@@ -742,13 +746,60 @@ fn gpu_badges_roll_up_from_pane_to_window_session_and_server() {
         .iter()
         .find(|row| matches!(row.id, NodeId::Window { .. }))
         .unwrap();
+    let session = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Session { .. }))
+        .unwrap();
+    assert!(session.gpu_badges.is_empty());
     assert_eq!(
         window.gpu_badges,
-        vec![GpuBadge::Memory {
-            digit: '3',
-            level: 1,
-            active: true,
-        }]
+        vec![
+            GpuBadge::Memory {
+                digit: ' ',
+                level: 0,
+                active: false,
+                placeholder: true,
+            },
+            GpuBadge::Memory {
+                digit: '3',
+                level: 1,
+                active: true,
+                placeholder: false,
+            },
+        ]
+    );
+
+    expanded.insert(NodeId::Window {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+        window: "0".to_string(),
+    });
+    let rows = build_rows(&[tree], &expanded, &test_line_formats());
+    let window = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Window { .. }))
+        .unwrap();
+    let pane = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+    assert!(window.gpu_badges.is_empty());
+    assert_eq!(
+        pane.gpu_badges,
+        vec![
+            GpuBadge::Memory {
+                digit: ' ',
+                level: 0,
+                active: false,
+                placeholder: true,
+            },
+            GpuBadge::Memory {
+                digit: '3',
+                level: 1,
+                active: true,
+                placeholder: false,
+            },
+        ]
     );
 }
 
@@ -800,11 +851,13 @@ fn child_gpu_badges_sum_memory_from_child_panes() {
     second.gpu_memory_by_index = vec![(0, 2048)];
     tree.panes.push(second);
 
-    let rows = build_rows(
-        &[tree.clone()],
-        &expanded_all(&[tree]),
-        &test_line_formats(),
-    );
+    let mut expanded = BTreeSet::new();
+    expanded.insert(NodeId::Host("t2".to_string()));
+    expanded.insert(NodeId::Session {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+    });
+    let rows = build_rows(&[tree], &expanded, &test_line_formats());
     let window = rows
         .iter()
         .find(|row| matches!(row.id, NodeId::Window { .. }))
@@ -816,7 +869,65 @@ fn child_gpu_badges_sum_memory_from_child_panes() {
             digit: '4',
             level: 1,
             active: true,
+            placeholder: false,
         }]
+    );
+}
+
+#[test]
+fn child_gpu_badges_keep_gpu_index_placeholders() {
+    let mut tree = test_host_tree("t2");
+    tree.gpus = (0..4)
+        .map(|index| GpuInfo {
+            index,
+            uuid: format!("GPU-{index}"),
+            memory_used_mib: 0,
+            memory_total_mib: 1000,
+        })
+        .collect();
+    tree.panes[0].gpu_indices = vec![0, 2];
+    tree.panes[0].gpu_memory_by_index = vec![(0, 100), (2, 300)];
+
+    let mut expanded = BTreeSet::new();
+    expanded.insert(NodeId::Host("t2".to_string()));
+    expanded.insert(NodeId::Session {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+    });
+    let rows = build_rows(&[tree], &expanded, &test_line_formats());
+    let window = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Window { .. }))
+        .unwrap();
+
+    assert_eq!(
+        window.gpu_badges,
+        vec![
+            GpuBadge::Memory {
+                digit: '1',
+                level: 0,
+                active: true,
+                placeholder: false,
+            },
+            GpuBadge::Memory {
+                digit: ' ',
+                level: 0,
+                active: false,
+                placeholder: true,
+            },
+            GpuBadge::Memory {
+                digit: '3',
+                level: 1,
+                active: true,
+                placeholder: false,
+            },
+            GpuBadge::Memory {
+                digit: ' ',
+                level: 0,
+                active: false,
+                placeholder: true,
+            },
+        ]
     );
 }
 
@@ -858,21 +969,25 @@ fn gpu_memory_badges_round_to_nearest_decile() {
                 digit: '0',
                 level: 0,
                 active: false,
+                placeholder: false,
             },
             GpuBadge::Memory {
                 digit: '1',
                 level: 0,
                 active: false,
+                placeholder: false,
             },
             GpuBadge::Memory {
                 digit: '9',
                 level: 3,
                 active: false,
+                placeholder: false,
             },
             GpuBadge::Memory {
                 digit: 'A',
                 level: 3,
                 active: false,
+                placeholder: false,
             },
         ]
     );
@@ -886,11 +1001,13 @@ fn gpu_badges_keep_right_edge_when_row_text_is_long() {
             digit: '0',
             level: 0,
             active: true,
+            placeholder: false,
         },
         GpuBadge::Memory {
             digit: '1',
             level: 0,
             active: true,
+            placeholder: false,
         },
     ];
 

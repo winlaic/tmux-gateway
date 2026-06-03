@@ -60,7 +60,9 @@ pub(crate) fn build_rows(
                 busy_duration_secs: (!expanded.contains(&session_id))
                     .then(|| max_busy_duration(windows.values().flatten().copied()))
                     .flatten(),
-                gpu_badges: process_gpu_badges(&tree.gpus, windows.values().flatten().copied()),
+                gpu_badges: (!expanded.contains(&session_id))
+                    .then(|| process_gpu_badges(&tree.gpus, windows.values().flatten().copied()))
+                    .unwrap_or_default(),
             });
 
             if !expanded.contains(&session_id) {
@@ -92,7 +94,9 @@ pub(crate) fn build_rows(
                     busy_duration_secs: (!expanded.contains(&window_id))
                         .then(|| max_busy_duration(panes.iter().copied()))
                         .flatten(),
-                    gpu_badges: process_gpu_badges(&tree.gpus, panes.iter().copied()),
+                    gpu_badges: (!expanded.contains(&window_id))
+                        .then(|| process_gpu_badges(&tree.gpus, panes.iter().copied()))
+                        .unwrap_or_default(),
                 });
 
                 if !expanded.contains(&window_id) {
@@ -344,6 +348,7 @@ fn server_gpu_badges(tree: &HostTree) -> Vec<GpuBadge> {
                 digit: decile_digit(decile as u8),
                 level: decile_level(decile as u8),
                 active: active_indices.contains(&gpu.index),
+                placeholder: false,
             }
         })
         .collect()
@@ -363,19 +368,23 @@ fn process_gpu_badges<'a>(
         return Vec::new();
     }
 
-    let total_by_index: BTreeMap<usize, u64> = gpus
-        .iter()
-        .map(|gpu| (gpu.index, gpu.memory_total_mib))
-        .collect();
-    memory_by_index
-        .into_iter()
-        .filter_map(|(index, memory_used_mib)| {
-            let decile = rounded_memory_decile(memory_used_mib, *total_by_index.get(&index)?);
-            Some(GpuBadge::Memory {
+    gpus.iter()
+        .map(|gpu| {
+            let Some(memory_used_mib) = memory_by_index.get(&gpu.index) else {
+                return GpuBadge::Memory {
+                    digit: ' ',
+                    level: 0,
+                    active: false,
+                    placeholder: true,
+                };
+            };
+            let decile = rounded_memory_decile(*memory_used_mib, gpu.memory_total_mib);
+            GpuBadge::Memory {
                 digit: decile_digit(decile),
                 level: decile_level(decile),
                 active: true,
-            })
+                placeholder: false,
+            }
         })
         .collect()
 }
