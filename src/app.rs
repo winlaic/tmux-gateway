@@ -394,8 +394,8 @@ impl App {
             }
         }
         sort_trees_by_config(&mut self.trees, &self.config.hosts);
-        self.apply_trees_after_refresh();
-        self.apply_search_from_current();
+        let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        self.apply_trees_after_refresh_preserving(selected_id);
     }
 
     fn ensure_tree(&mut self, host: &str) -> &mut HostTree {
@@ -416,10 +416,23 @@ impl App {
     }
 
     pub(crate) fn apply_trees_after_refresh(&mut self) {
+        self.apply_trees_after_refresh_preserving(None);
+    }
+
+    fn apply_trees_after_refresh_preserving(&mut self, selected_id: Option<NodeId>) {
         self.expand_initial_if_ready();
         self.rebuild_rows();
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        if let Some(selected_id) = selected_id {
+            if let Some(index) = self.rows.iter().position(|row| row.id == selected_id) {
+                self.selected = index;
+            } else {
+                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+            }
+        } else {
+            self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        }
         self.clamp_scroll();
+        self.fit_scroll_to_height(self.viewport_height);
     }
 
     fn set_status(&mut self, message: impl Into<String>) {

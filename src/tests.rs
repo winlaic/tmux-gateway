@@ -1144,6 +1144,27 @@ fn starting_search_clears_previous_input() {
 }
 
 #[test]
+fn scan_refresh_preserves_current_selection_instead_of_reapplying_search() {
+    let mut app = test_app_with_tree(test_host_tree("needle-host"));
+    let pane_index = app
+        .rows
+        .iter()
+        .position(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+    app.selected = pane_index;
+    app.search = "needle".to_string();
+    let selected_id = app.rows[app.selected].id.clone();
+
+    app.apply_scan_results(vec![HostUpdate::Gpus {
+        host: "needle-host".to_string(),
+        gpus: Vec::new(),
+        gpu_processes: Vec::new(),
+    }]);
+
+    assert_eq!(app.rows[app.selected].id, selected_id);
+}
+
+#[test]
 fn tmux_mutation_actions_report_their_host() {
     assert_eq!(
         PromptKind::RenameWindow {
