@@ -1,0 +1,347 @@
+use std::collections::BTreeMap;
+use std::process::Command;
+use std::sync::mpsc;
+
+use anyhow::{Context, Result, bail};
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
+
+use crate::config::Config;
+use crate::model::{HostTree, PaneInfo, ProcessInfo};
+
+pub(crate) fn collect_hosts(config: &Config) -> Vec<HostTree> {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config.scan_concurrency)
+        .build();
+
+    match pool {
+        Ok(pool) => pool.install(|| {
+            config
+                .hosts
+                .par_iter()
+                .map(|host| collect_host(host, config.connect_timeout_secs))
+                .collect()
+        }),
+        Err(_) => config
+            .hosts
+            .iter()
+            .map(|host| collect_host(host, config.connect_timeout_secs))
+            .collect(),
+    }
+}
+
+pub(crate) fn collect_hosts_streaming(
+    config: &Config,
+    hosts: &[String],
+    sender: mpsc::Sender<HostTree>,
+) {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(config.scan_concurrency)
+        .build();
+
+    match pool {
+        Ok(pool) => pool.install(|| {
+            hosts.par_iter().for_each(|host| {
+                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+            });
+        }),
+        Err(_) => {
+            for host in hosts {
+                let _ = sender.send(collect_host(host, config.connect_timeout_secs));
+            }
+        }
+    }
+}
+
+fn collect_host(host: &str, connect_timeout_secs: u64) -> HostTree {
+    match list_remote_panes(host, connect_timeout_secs) {
+        Ok(panes) => HostTree {
+            host: host.to_string(),
+            panes,
+            error: None,
+            connecting: false,
+        },
+        Err(err) => HostTree {
+            host: host.to_string(),
+            panes: Vec::new(),
+            error: Some(err.to_string()),
+            connecting: false,
+        },
+    }
+}
+
+pub(crate) fn sort_trees_by_config(trees: &mut [HostTree], hosts: &[String]) {
+    let order: BTreeMap<&str, usize> = hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| (host.as_str(), index))
+        .collect();
+    trees.sort_by_key(|tree| order.get(tree.host.as_str()).copied().unwrap_or(usize::MAX));
+}
+
+fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<Vec<PaneInfo>> {
+    let format = [
+        "#{session_name}",
+        "#{session_id}",
+        "#{window_index}",
+        "#{window_id}",
+        "#{window_name}",
+        "#{pane_index}",
+        "#{pane_id}",
+        "#{pane_pid}",
+        "#{pane_current_command}",
+        "#{pane_current_path}",
+        "#{pane_title}",
+        "#{window_active}",
+        "#{pane_active}",
+    ]
+    .join("\t");
+
+    let remote_command = format!(
+        "printf '%s\\n' __TMUX_GATEWAY_PANES__; tmux list-panes -a -F {}; printf '%s\\n' __TMUX_GATEWAY_PROCESSES__; ps -eo pid=,ppid=,etimes=,comm=,args= 2>/dev/null || true",
+        shell_quote(&format),
+    );
+    let output = Command::new("ssh")
+        .args(ssh_options(connect_timeout_secs))
+        .arg(host)
+        .arg(remote_command)
+        .output()
+        .with_context(|| format!("failed to start ssh for host {host}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("no server running") || stderr.contains("No such file or directory") {
+            return Ok(Vec::new());
+        }
+        bail!(
+            "ssh/tmux command failed for host {host}: {}",
+            if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("tmux output from host {host} was not utf-8"))?;
+    parse_remote_snapshot(&stdout)
+        .with_context(|| format!("failed to parse tmux panes from host {host}"))
+}
+
+pub(crate) fn parse_remote_snapshot(output: &str) -> Result<Vec<PaneInfo>> {
+    let mut pane_lines = Vec::new();
+    let mut process_lines = Vec::new();
+    let mut section = "";
+
+    for line in output.lines() {
+        match line {
+            "__TMUX_GATEWAY_PANES__" => {
+                section = "panes";
+                continue;
+            }
+            "__TMUX_GATEWAY_PROCESSES__" => {
+                section = "processes";
+                continue;
+            }
+            _ => {}
+        }
+
+        match section {
+            "panes" => pane_lines.push(line),
+            "processes" => process_lines.push(line),
+            _ => {}
+        }
+    }
+
+    let mut panes = parse_panes(&pane_lines.join("\n"))?;
+    let processes = parse_processes(&process_lines.join("\n"));
+    mark_busy_panes(&mut panes, &processes);
+    Ok(panes)
+}
+
+pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
+    let mut panes = Vec::new();
+
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 13 {
+            bail!(
+                "expected 13 tab-separated fields, got {} in line {line:?}",
+                fields.len()
+            );
+        }
+
+        panes.push(PaneInfo {
+            session_name: fields[0].to_string(),
+            session_id: fields[1].to_string(),
+            window_index: fields[2].to_string(),
+            window_id: fields[3].to_string(),
+            window_name: fields[4].to_string(),
+            pane_index: fields[5].to_string(),
+            pane_id: fields[6].to_string(),
+            pane_pid: fields[7].parse().unwrap_or(0),
+            pane_current_command: fields[8].to_string(),
+            pane_commandline: fields[8].to_string(),
+            pane_current_path: fields[9].to_string(),
+            pane_title: fields[10].to_string(),
+            active_window: fields[11] == "1",
+            active_pane: fields[12] == "1",
+            busy_duration_secs: None,
+        });
+    }
+
+    Ok(panes)
+}
+
+fn parse_processes(output: &str) -> Vec<ProcessInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            let elapsed_secs = parts.next()?.parse().ok()?;
+            let command = parts.next()?.to_string();
+            let commandline = parts.collect::<Vec<_>>().join(" ");
+            Some(ProcessInfo {
+                pid,
+                ppid,
+                elapsed_secs,
+                command,
+                commandline,
+            })
+        })
+        .collect()
+}
+
+fn mark_busy_panes(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
+    let commandline_by_pid: BTreeMap<u32, String> = processes
+        .iter()
+        .map(|process| (process.pid, process.commandline.clone()))
+        .collect();
+    let process_by_pid: BTreeMap<u32, &ProcessInfo> = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
+    let mut children_by_parent: BTreeMap<u32, Vec<&ProcessInfo>> = BTreeMap::new();
+    for process in processes {
+        children_by_parent
+            .entry(process.ppid)
+            .or_default()
+            .push(process);
+    }
+
+    for pane in panes {
+        if let Some(commandline) = commandline_by_pid.get(&pane.pane_pid) {
+            pane.pane_commandline = commandline.clone();
+        }
+        if let Some(commandline) = pane_active_commandline(pane, &children_by_parent) {
+            pane.pane_commandline = commandline;
+        }
+        pane.busy_duration_secs = pane_busy_duration(pane, &process_by_pid, &children_by_parent);
+    }
+}
+
+fn pane_active_commandline(
+    pane: &PaneInfo,
+    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
+) -> Option<String> {
+    if pane.pane_pid == 0 || !is_shell_command(&pane.pane_current_command) {
+        return None;
+    }
+
+    let mut best: Option<(u64, String)> = None;
+    let mut stack = children_by_parent
+        .get(&pane.pane_pid)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(process) = stack.pop() {
+        if !is_shell_command(&process.command) {
+            match &best {
+                Some((elapsed, _)) if *elapsed >= process.elapsed_secs => {}
+                _ => best = Some((process.elapsed_secs, process.commandline.clone())),
+            }
+        }
+        if let Some(children) = children_by_parent.get(&process.pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    best.map(|(_, commandline)| commandline)
+}
+
+pub(crate) fn pane_busy_duration(
+    pane: &PaneInfo,
+    process_by_pid: &BTreeMap<u32, &ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
+) -> Option<u64> {
+    if pane.pane_pid == 0 {
+        return None;
+    }
+
+    if let Some(process) = process_by_pid.get(&pane.pane_pid) {
+        if !is_shell_command(&process.command) {
+            return Some(process.elapsed_secs);
+        }
+    }
+
+    let mut max_elapsed = None;
+    let mut stack = children_by_parent
+        .get(&pane.pane_pid)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(process) = stack.pop() {
+        if !is_shell_command(&process.command) {
+            max_elapsed = Some(max_elapsed.unwrap_or(0).max(process.elapsed_secs));
+        }
+        if let Some(children) = children_by_parent.get(&process.pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    max_elapsed
+}
+
+fn is_shell_command(command: &str) -> bool {
+    let command = command.rsplit('/').next().unwrap_or(command);
+    matches!(
+        command,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "mksh"
+            | "tcsh"
+            | "csh"
+            | "pwsh"
+            | "powershell"
+    )
+}
+
+pub(crate) fn ssh_options(connect_timeout_secs: u64) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={connect_timeout_secs}"),
+    ]
+}
+
+pub(crate) fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
