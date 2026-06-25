@@ -16,8 +16,8 @@ use crate::model::{
     GpuBadge, GpuInfo, HostTree, HostUpdate, NodeId, PaneInfo, ProcessInfo, RowStatus, VisibleRow,
 };
 use crate::remote::{
-    mark_pane_gpu_indices, pane_busy_duration, parse_gpu_processes, parse_gpu_snapshot, parse_gpus,
-    parse_panes, shell_quote,
+    mark_created_times_at, mark_pane_gpu_indices, pane_busy_duration, parse_gpu_processes,
+    parse_gpu_snapshot, parse_gpus, parse_panes, shell_quote,
 };
 use crate::tree::{SearchStart, build_rows, expanded_all, format_line, host_detail, search_rows};
 use crate::ui::{
@@ -35,14 +35,17 @@ fn shell_quote_handles_single_quote() {
 
 #[test]
 fn parse_panes_reads_tmux_format() {
-    let output = "s\t$1\t0\t@2\tzsh\t1\t%3\t123\tvim\t/tmp/project\ttitle\t1\t0\n";
+    let output = "s\t$1\t1700000000\t0\t@2\tzsh\t1\t%3\t123\tvim\t/tmp/project\ttitle\t1\t0\n";
     let panes = parse_panes(output).unwrap();
 
     assert_eq!(panes.len(), 1);
     assert_eq!(panes[0].session_name, "s");
     assert_eq!(panes[0].session_id, "$1");
+    assert_eq!(panes[0].session_created, Some(1_700_000_000));
     assert_eq!(panes[0].window_id, "@2");
+    assert_eq!(panes[0].window_created, None);
     assert_eq!(panes[0].pane_id, "%3");
+    assert_eq!(panes[0].pane_created, None);
     assert_eq!(panes[0].pane_current_path, "/tmp/project");
     assert!(panes[0].active_window);
     assert!(!panes[0].active_pane);
@@ -615,6 +618,74 @@ fn process_placeholders_control_busy_text() {
         .unwrap();
     assert_eq!(window_row.label, "0 running 42s");
     assert_eq!(window_row.detail, "1 panes");
+}
+
+#[test]
+fn created_time_marker_derives_pane_and_window_created_times() {
+    let mut first = test_pane();
+    first.pane_pid = 11;
+    let mut second = test_pane();
+    second.pane_id = "%1".to_string();
+    second.pane_index = "1".to_string();
+    second.pane_pid = 22;
+    let mut panes = vec![first, second];
+    let processes = vec![
+        ProcessInfo {
+            pid: 11,
+            ppid: 1,
+            elapsed_secs: 40,
+            command: "zsh".to_string(),
+            commandline: "zsh".to_string(),
+        },
+        ProcessInfo {
+            pid: 22,
+            ppid: 1,
+            elapsed_secs: 90,
+            command: "zsh".to_string(),
+            commandline: "zsh".to_string(),
+        },
+    ];
+
+    mark_created_times_at(&mut panes, &processes, 1_000);
+
+    assert_eq!(panes[0].pane_created, Some(960));
+    assert_eq!(panes[1].pane_created, Some(910));
+    assert_eq!(panes[0].window_created, Some(910));
+    assert_eq!(panes[1].window_created, Some(910));
+}
+
+#[test]
+fn uptime_placeholders_use_human_duration_text() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].session_created = Some(now - 93_600);
+    tree.panes[0].window_created = Some(now - 7_380);
+    tree.panes[0].pane_created = Some(now - 75);
+    let mut formats = test_line_formats();
+    formats.session = "{session_name} {session_uptime}".to_string();
+    formats.window = "{window_index} {session_uptime} {window_uptime}".to_string();
+    formats.pane = "{pane_id} {session_uptime} {window_uptime} {pane_uptime}".to_string();
+
+    let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+    let session_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Session { .. }))
+        .unwrap();
+    let window_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Window { .. }))
+        .unwrap();
+    let pane_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    assert_eq!(session_row.label, "main 1d2h");
+    assert_eq!(window_row.label, "0 1d2h 2h3m");
+    assert_eq!(pane_row.label, "%0 1d2h 2h3m 1m15s");
 }
 
 #[test]
@@ -1371,11 +1442,14 @@ fn test_pane() -> PaneInfo {
     PaneInfo {
         session_name: "main".to_string(),
         session_id: "$1".to_string(),
+        session_created: None,
         window_index: "0".to_string(),
         window_id: "@2".to_string(),
+        window_created: None,
         window_name: "pwsh".to_string(),
         pane_index: "0".to_string(),
         pane_id: "%0".to_string(),
+        pane_created: None,
         pane_pid: 123,
         pane_current_command: "pwsh".to_string(),
         pane_commandline: "pwsh -NoLogo".to_string(),

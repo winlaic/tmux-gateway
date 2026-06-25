@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::SearchDirection;
 use crate::config::LineFormats;
@@ -11,6 +12,7 @@ pub(crate) fn build_rows(
     line_formats: &LineFormats,
 ) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
+    let now_epoch = current_unix_epoch();
 
     for tree in trees {
         let host_id = NodeId::Host(tree.host.clone());
@@ -51,7 +53,13 @@ pub(crate) fn build_rows(
             rows.push(VisibleRow {
                 id: session_id.clone(),
                 depth: 1,
-                label: format_session_line(tree, &session_name, windows.len(), line_formats),
+                label: format_session_line(
+                    tree,
+                    &session_name,
+                    windows.len(),
+                    line_formats,
+                    now_epoch,
+                ),
                 detail: format!("{} windows", windows.len()),
                 search_text: session_name.clone(),
                 selectable: false,
@@ -85,6 +93,7 @@ pub(crate) fn build_rows(
                         &window_index,
                         &panes,
                         line_formats,
+                        now_epoch,
                     ),
                     detail: format!("{} panes", panes.len()),
                     search_text: format!("{} {}", window_index, first.window_name),
@@ -119,6 +128,7 @@ pub(crate) fn build_rows(
                             &window_index,
                             pane,
                             line_formats,
+                            now_epoch,
                         ),
                         detail: String::new(),
                         search_text: format!(
@@ -197,6 +207,7 @@ fn format_session_line(
     session_name: &str,
     window_count: usize,
     line_formats: &LineFormats,
+    now_epoch: u64,
 ) -> String {
     let panes: Vec<&PaneInfo> = tree
         .panes
@@ -208,6 +219,13 @@ fn format_session_line(
     values.insert("server_name", tree.host.clone());
     values.insert("host", tree.host.clone());
     values.insert("session_name", session_name.to_string());
+    values.insert(
+        "session_uptime",
+        uptime_value(
+            min_created_epoch(panes.iter().map(|pane| pane.session_created)),
+            now_epoch,
+        ),
+    );
     values.insert("window_count", window_count.to_string());
     values.insert("pane_count", panes.len().to_string());
     insert_process_values(&mut values, busy_duration);
@@ -220,6 +238,7 @@ fn format_window_line(
     window_index: &str,
     panes: &[&PaneInfo],
     line_formats: &LineFormats,
+    now_epoch: u64,
 ) -> String {
     let first = panes[0];
     let busy_duration = max_busy_duration(panes.iter().copied());
@@ -227,7 +246,21 @@ fn format_window_line(
     values.insert("server_name", host.to_string());
     values.insert("host", host.to_string());
     values.insert("session_name", session_name.to_string());
+    values.insert(
+        "session_uptime",
+        uptime_value(
+            min_created_epoch(panes.iter().map(|pane| pane.session_created)),
+            now_epoch,
+        ),
+    );
     values.insert("window_index", window_index.to_string());
+    values.insert(
+        "window_uptime",
+        uptime_value(
+            min_created_epoch(panes.iter().map(|pane| pane.window_created)),
+            now_epoch,
+        ),
+    );
     values.insert("window_name", first.window_name.clone());
     values.insert("window_panes", panes.len().to_string());
     values.insert(
@@ -244,15 +277,25 @@ fn format_pane_line(
     window_index: &str,
     pane: &PaneInfo,
     line_formats: &LineFormats,
+    now_epoch: u64,
 ) -> String {
     let mut values = BTreeMap::new();
     values.insert("server_name", host.to_string());
     values.insert("host", host.to_string());
     values.insert("session_name", session_name.to_string());
+    values.insert(
+        "session_uptime",
+        uptime_value(pane.session_created, now_epoch),
+    );
     values.insert("window_index", window_index.to_string());
+    values.insert(
+        "window_uptime",
+        uptime_value(pane.window_created, now_epoch),
+    );
     values.insert("window_name", pane.window_name.clone());
     values.insert("pane_index", pane.pane_index.clone());
     values.insert("pane_id", pane.pane_id.clone());
+    values.insert("pane_uptime", uptime_value(pane.pane_created, now_epoch));
     values.insert("pane_pid", pane.pane_pid.to_string());
     values.insert("pane_current_command", pane.pane_current_command.clone());
     values.insert("pane_command", pane.pane_current_command.clone());
@@ -273,6 +316,23 @@ fn format_pane_line(
     );
     insert_process_values(&mut values, pane.busy_duration_secs);
     format_line(&line_formats.pane, &values)
+}
+
+fn current_unix_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn min_created_epoch(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    values.flatten().min()
+}
+
+fn uptime_value(created_epoch: Option<u64>, now_epoch: u64) -> String {
+    created_epoch
+        .map(|created_epoch| human_duration(now_epoch.saturating_sub(created_epoch)))
+        .unwrap_or_default()
 }
 
 fn insert_process_values(values: &mut BTreeMap<&'static str, String>, duration: Option<u64>) {

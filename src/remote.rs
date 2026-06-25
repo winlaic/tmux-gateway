@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rayon::ThreadPoolBuilder;
@@ -154,6 +155,7 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<PaneSnapsh
     let format = [
         "#{session_name}",
         "#{session_id}",
+        "#{session_created}",
         "#{window_index}",
         "#{window_id}",
         "#{window_name}",
@@ -230,6 +232,7 @@ fn parse_remote_snapshot(output: &str) -> Result<PaneSnapshot> {
 
     let mut panes = parse_panes(&pane_lines.join("\n"))?;
     let processes = parse_processes(&process_lines.join("\n"));
+    mark_created_times(&mut panes, &processes);
     mark_busy_panes(&mut panes, &processes);
     Ok(PaneSnapshot { panes, processes })
 }
@@ -239,9 +242,9 @@ pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 13 {
+        if fields.len() != 14 {
             bail!(
-                "expected 13 tab-separated fields, got {} in line {line:?}",
+                "expected 14 tab-separated fields, got {} in line {line:?}",
                 fields.len()
             );
         }
@@ -249,18 +252,21 @@ pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
         panes.push(PaneInfo {
             session_name: fields[0].to_string(),
             session_id: fields[1].to_string(),
-            window_index: fields[2].to_string(),
-            window_id: fields[3].to_string(),
-            window_name: fields[4].to_string(),
-            pane_index: fields[5].to_string(),
-            pane_id: fields[6].to_string(),
-            pane_pid: fields[7].parse().unwrap_or(0),
-            pane_current_command: fields[8].to_string(),
-            pane_commandline: fields[8].to_string(),
-            pane_current_path: fields[9].to_string(),
-            pane_title: fields[10].to_string(),
-            active_window: fields[11] == "1",
-            active_pane: fields[12] == "1",
+            session_created: parse_created_epoch(fields[2]),
+            window_index: fields[3].to_string(),
+            window_id: fields[4].to_string(),
+            window_created: None,
+            window_name: fields[5].to_string(),
+            pane_index: fields[6].to_string(),
+            pane_id: fields[7].to_string(),
+            pane_created: None,
+            pane_pid: fields[8].parse().unwrap_or(0),
+            pane_current_command: fields[9].to_string(),
+            pane_commandline: fields[9].to_string(),
+            pane_current_path: fields[10].to_string(),
+            pane_title: fields[11].to_string(),
+            active_window: fields[12] == "1",
+            active_pane: fields[13] == "1",
             busy_duration_secs: None,
             gpu_indices: Vec::new(),
             gpu_memory_by_index: Vec::new(),
@@ -268,6 +274,54 @@ pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
     }
 
     Ok(panes)
+}
+
+fn parse_created_epoch(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|seconds| *seconds > 0)
+}
+
+fn mark_created_times(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
+    mark_created_times_at(panes, processes, current_unix_epoch());
+}
+
+pub(crate) fn mark_created_times_at(
+    panes: &mut [PaneInfo],
+    processes: &[ProcessInfo],
+    now_epoch: u64,
+) {
+    let process_by_pid: BTreeMap<u32, &ProcessInfo> = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
+
+    for pane in panes.iter_mut() {
+        pane.pane_created = process_by_pid
+            .get(&pane.pane_pid)
+            .map(|process| now_epoch.saturating_sub(process.elapsed_secs));
+    }
+
+    let mut window_created_by_key: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for pane in panes.iter().filter(|pane| pane.pane_created.is_some()) {
+        let key = (pane.session_name.clone(), pane.window_index.clone());
+        let pane_created = pane.pane_created.unwrap_or_default();
+        window_created_by_key
+            .entry(key)
+            .and_modify(|window_created| *window_created = (*window_created).min(pane_created))
+            .or_insert(pane_created);
+    }
+
+    for pane in panes {
+        pane.window_created = window_created_by_key
+            .get(&(pane.session_name.clone(), pane.window_index.clone()))
+            .copied();
+    }
+}
+
+fn current_unix_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn collect_remote_gpus(

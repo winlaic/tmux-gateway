@@ -112,9 +112,9 @@ Unknown placeholders are preserved as written.
 Common placeholders:
 
 - Server: `{server_name}`, `{host}`, `{session_count}`, `{window_count}`, `{pane_count}`, `{process_status}`, `{process_elapsed_time}`
-- Session: `{server_name}`, `{host}`, `{session_name}`, `{window_count}`, `{pane_count}`, `{process_status}`, `{process_elapsed_time}`
-- Window: `{server_name}`, `{host}`, `{session_name}`, `{window_index}`, `{window_name}`, `{window_panes}`, `{is_active}`, `{process_status}`, `{process_elapsed_time}`
-- Pane: `{server_name}`, `{host}`, `{session_name}`, `{window_index}`, `{window_name}`, `{pane_index}`, `{pane_id}`, `{pane_pid}`, `{pane_current_command}`, `{pane_command}`, `{pane_commandline}`, `{pane_current_path}`, `{pane_title}`, `{pane_title_prefix}`, `{is_active}`, `{process_status}`, `{process_elapsed_time}`
+- Session: `{server_name}`, `{host}`, `{session_name}`, `{session_uptime}`, `{window_count}`, `{pane_count}`, `{process_status}`, `{process_elapsed_time}`
+- Window: `{server_name}`, `{host}`, `{session_name}`, `{session_uptime}`, `{window_index}`, `{window_name}`, `{window_panes}`, `{window_uptime}`, `{is_active}`, `{process_status}`, `{process_elapsed_time}`
+- Pane: `{server_name}`, `{host}`, `{session_name}`, `{session_uptime}`, `{window_index}`, `{window_name}`, `{window_uptime}`, `{pane_index}`, `{pane_id}`, `{pane_uptime}`, `{pane_pid}`, `{pane_current_command}`, `{pane_command}`, `{pane_commandline}`, `{pane_current_path}`, `{pane_title}`, `{pane_title_prefix}`, `{is_active}`, `{process_status}`, `{process_elapsed_time}`
 
 ## Controls
 

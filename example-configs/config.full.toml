@@ -38,13 +38,14 @@ server_line_text = "[Server] {server_name}"
 # Session row format.
 # Placeholders:
 # {server_name} {host} {session_name} {window_count} {pane_count}
-# {process_status} {process_elapsed_time}
+# {session_uptime} {process_status} {process_elapsed_time}
 session_line_text = "[Session] {session_name}"
 
 # Window row format.
 # Placeholders:
 # {server_name} {host} {session_name} {window_index} {window_name}
-# {window_panes} {is_active} {process_status} {process_elapsed_time}
+# {session_uptime} {window_panes} {window_uptime} {is_active}
+# {process_status} {process_elapsed_time}
 window_line_text = "[Window] {is_active}{window_index}: {window_name}"
 
 # Pane row format.
@@ -52,5 +53,5 @@ window_line_text = "[Window] {is_active}{window_index}: {window_name}"
 # {server_name} {host} {session_name} {window_index} {window_name}
 # {pane_index} {pane_id} {pane_pid} {pane_current_command} {pane_command}
 # {pane_commandline} {pane_current_path} {pane_title} {pane_title_prefix} {is_active}
-# {process_status} {process_elapsed_time}
+# {session_uptime} {window_uptime} {pane_uptime} {process_status} {process_elapsed_time}
 pane_line_text = "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}"
