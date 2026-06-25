@@ -638,7 +638,8 @@ fn pane_display_pids(
     process_by_pid: &BTreeMap<u32, &ProcessInfo>,
     children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
 ) -> BTreeSet<u32> {
-    panes.iter()
+    panes
+        .iter()
         .filter_map(|pane| pane_display_process(pane, process_by_pid, children_by_parent))
         .map(|process| process.pid)
         .collect()
@@ -649,7 +650,8 @@ pub(crate) fn pane_busy_duration(
     process_by_pid: &BTreeMap<u32, &ProcessInfo>,
     children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
 ) -> Option<u64> {
-    pane_running_process(pane, process_by_pid, children_by_parent).map(|process| process.elapsed_secs)
+    pane_running_process(pane, process_by_pid, children_by_parent)
+        .map(|process| process.elapsed_secs)
 }
 
 fn process_by_pid(processes: &[ProcessInfo]) -> BTreeMap<u32, &ProcessInfo> {

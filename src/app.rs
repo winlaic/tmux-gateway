@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -251,6 +251,8 @@ pub(crate) enum ContextAction {
     NewSession,
     NewWindow,
     NewPane,
+    SplitVertical,
+    SplitHorizontal,
     Rename,
 }
 
@@ -910,6 +912,8 @@ impl App {
         let Some(row) = self.rows.get(self.selected) else {
             return Vec::new();
         };
+        let active_pane_row =
+            self.page_mode == PageMode::ActivePanes && matches!(row.id, NodeId::Pane { .. });
 
         let mut items = Vec::new();
         if matches!(row.id, NodeId::Window { .. } | NodeId::Pane { .. }) {
@@ -956,11 +960,25 @@ impl App {
                     shortcut: Some('p'),
                 });
             }
-            NodeId::Pane { .. } => items.push(ContextMenuItem {
-                label: "new pane".to_string(),
-                action: ContextAction::NewPane,
-                shortcut: Some('p'),
-            }),
+            NodeId::Pane { .. } => {
+                if active_pane_row {
+                    items.push(ContextMenuItem {
+                        label: "new session".to_string(),
+                        action: ContextAction::NewSession,
+                        shortcut: Some('s'),
+                    });
+                    items.push(ContextMenuItem {
+                        label: "new window".to_string(),
+                        action: ContextAction::NewWindow,
+                        shortcut: Some('w'),
+                    });
+                }
+                items.push(ContextMenuItem {
+                    label: "new pane".to_string(),
+                    action: ContextAction::NewPane,
+                    shortcut: Some('p'),
+                });
+            }
         }
         if !matches!(row.id, NodeId::Host(_)) {
             items.push(ContextMenuItem {
@@ -1026,7 +1044,7 @@ impl App {
                     self.mode = Mode::Normal;
                     let result = self.run_context_action(action);
                     if let Err(err) = result {
-                        self.set_temp_status(result_status(
+                        self.set_temp_status(result_status::<()>(
                             Err(err),
                             "completed",
                             self.config.log_path.as_deref(),
@@ -1069,6 +1087,10 @@ impl App {
             ContextAction::NewSession => self.start_create_session(),
             ContextAction::NewWindow => self.start_create_window(),
             ContextAction::NewPane => self.start_create_pane(),
+            ContextAction::SplitVertical => self.start_split_selected_pane(SplitChoice::Vertical),
+            ContextAction::SplitHorizontal => {
+                self.start_split_selected_pane(SplitChoice::Horizontal)
+            }
             ContextAction::Rename => self.start_rename(),
         }
         Ok(())
@@ -1181,6 +1203,35 @@ impl App {
     }
 
     fn create_menu_items(&self) -> Vec<ContextMenuItem> {
+        let Some(row) = self.rows.get(self.selected) else {
+            return Vec::new();
+        };
+
+        if self.page_mode == PageMode::ActivePanes && matches!(row.id, NodeId::Pane { .. }) {
+            return vec![
+                ContextMenuItem {
+                    label: "new session".to_string(),
+                    action: ContextAction::NewSession,
+                    shortcut: Some('s'),
+                },
+                ContextMenuItem {
+                    label: "new window".to_string(),
+                    action: ContextAction::NewWindow,
+                    shortcut: Some('w'),
+                },
+                ContextMenuItem {
+                    label: "vertical split".to_string(),
+                    action: ContextAction::SplitVertical,
+                    shortcut: Some('v'),
+                },
+                ContextMenuItem {
+                    label: "horizontal split".to_string(),
+                    action: ContextAction::SplitHorizontal,
+                    shortcut: Some('h'),
+                },
+            ];
+        }
+
         self.context_menu_items()
             .into_iter()
             .filter(|item| {
@@ -1235,6 +1286,12 @@ impl App {
                 host,
                 session,
                 window,
+            }
+            | NodeId::Pane {
+                host,
+                session,
+                window,
+                ..
             } => {
                 let target = session_target_for(&self.trees, host, session)
                     .unwrap_or_else(|| session.clone());
@@ -1256,35 +1313,39 @@ impl App {
 
     fn start_create_pane(&mut self) {
         self.pending_g = false;
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some((host, pane)) = self.selected_split_target() else {
+            self.set_temp_status("select a window or pane to create a pane");
             return;
         };
+        self.mode = Mode::SplitChoice(SplitChoiceState {
+            host,
+            pane,
+            selected: SplitChoice::Vertical,
+        });
+    }
 
-        match &row.id {
-            NodeId::Window {
-                host,
-                session,
-                window,
-            } => {
-                let Some(pane) = pane_for_window(&self.trees, host, session, window) else {
-                    self.set_temp_status("window has no pane target");
-                    return;
-                };
-                self.mode = Mode::SplitChoice(SplitChoiceState {
-                    host: host.clone(),
-                    pane,
-                    selected: SplitChoice::Vertical,
-                });
-            }
-            NodeId::Pane { host, pane, .. } => {
-                self.mode = Mode::SplitChoice(SplitChoiceState {
-                    host: host.clone(),
-                    pane: pane.clone(),
-                    selected: SplitChoice::Vertical,
-                });
-            }
-            _ => self.set_temp_status("select a window or pane to create a pane"),
+    fn start_split_selected_pane(&mut self, split: SplitChoice) {
+        self.pending_g = false;
+        let Some((host, pane)) = self.selected_split_target() else {
+            self.set_temp_status("select a window or pane to split");
+            return;
+        };
+        let (result, attach_target) = split_attach_result(split_remote_pane(
+            &host,
+            &pane,
+            split,
+            self.config.connect_timeout_secs,
+            self.config.log_path.as_deref(),
+        ));
+        self.request_refresh_host(host.clone());
+        if let Some(target) = attach_target {
+            self.attach_request = Some(target);
         }
+        self.set_temp_status(result_status(
+            result,
+            "pane split",
+            self.config.log_path.as_deref(),
+        ));
     }
 
     fn start_rename(&mut self) {
@@ -1331,6 +1392,22 @@ impl App {
         };
     }
 
+    fn selected_split_target(&self) -> Option<(String, String)> {
+        let row = self.rows.get(self.selected)?;
+        match &row.id {
+            NodeId::Window {
+                host,
+                session,
+                window,
+            } => {
+                let pane = pane_for_window(&self.trees, host, session, window)?;
+                Some((host.clone(), pane))
+            }
+            NodeId::Pane { host, pane, .. } => Some((host.clone(), pane.clone())),
+            _ => None,
+        }
+    }
+
     fn handle_prompt_key(&mut self, code: KeyCode) -> Result<()> {
         let Mode::Prompt(mut prompt) = self.mode.clone() else {
             return Ok(());
@@ -1342,49 +1419,63 @@ impl App {
                 self.set_temp_status("prompt cancelled");
             }
             KeyCode::Enter => {
-                let result = match &prompt.kind {
-                    PromptKind::CreateSession { host } => create_remote_session(
-                        host,
-                        optional_name(&prompt.value),
-                        self.config.connect_timeout_secs,
-                        self.config.log_path.as_deref(),
-                    ),
+                let (result, attach_target) = match &prompt.kind {
+                    PromptKind::CreateSession { host } => {
+                        split_attach_result(create_remote_session(
+                            host,
+                            optional_name(&prompt.value),
+                            self.config.connect_timeout_secs,
+                            self.config.log_path.as_deref(),
+                        ))
+                    }
                     PromptKind::CreateWindow {
                         host,
                         target,
                         after_window,
-                    } => create_remote_window(
+                    } => split_attach_result(create_remote_window(
                         host,
                         target,
                         after_window.as_deref(),
                         optional_name(&prompt.value),
                         self.config.connect_timeout_secs,
                         self.config.log_path.as_deref(),
+                    )),
+                    PromptKind::RenameSession { host, target } => (
+                        rename_remote_session(
+                            host,
+                            target,
+                            prompt.value.trim(),
+                            self.config.connect_timeout_secs,
+                            self.config.log_path.as_deref(),
+                        ),
+                        None,
                     ),
-                    PromptKind::RenameSession { host, target } => rename_remote_session(
-                        host,
-                        target,
-                        prompt.value.trim(),
-                        self.config.connect_timeout_secs,
-                        self.config.log_path.as_deref(),
+                    PromptKind::RenameWindow { host, target } => (
+                        rename_remote_window(
+                            host,
+                            target,
+                            prompt.value.trim(),
+                            self.config.connect_timeout_secs,
+                            self.config.log_path.as_deref(),
+                        ),
+                        None,
                     ),
-                    PromptKind::RenameWindow { host, target } => rename_remote_window(
-                        host,
-                        target,
-                        prompt.value.trim(),
-                        self.config.connect_timeout_secs,
-                        self.config.log_path.as_deref(),
-                    ),
-                    PromptKind::RenamePane { host, pane } => rename_remote_pane(
-                        host,
-                        pane,
-                        prompt.value.trim(),
-                        self.config.connect_timeout_secs,
-                        self.config.log_path.as_deref(),
+                    PromptKind::RenamePane { host, pane } => (
+                        rename_remote_pane(
+                            host,
+                            pane,
+                            prompt.value.trim(),
+                            self.config.connect_timeout_secs,
+                            self.config.log_path.as_deref(),
+                        ),
+                        None,
                     ),
                 };
                 self.mode = Mode::Normal;
                 self.request_refresh_host(prompt.kind.host().to_string());
+                if let Some(target) = attach_target {
+                    self.attach_request = Some(target);
+                }
                 self.set_temp_status(result_status(
                     result,
                     prompt_success(&prompt.kind),
@@ -1433,15 +1524,18 @@ impl App {
                 self.mode = Mode::SplitChoice(choice);
             }
             KeyCode::Enter | KeyCode::Char('y') => {
-                let result = split_remote_pane(
+                let (result, attach_target) = split_attach_result(split_remote_pane(
                     &choice.host,
                     &choice.pane,
                     choice.selected,
                     self.config.connect_timeout_secs,
                     self.config.log_path.as_deref(),
-                );
+                ));
                 self.mode = Mode::Normal;
                 self.request_refresh_host(choice.host.clone());
+                if let Some(target) = attach_target {
+                    self.attach_request = Some(target);
+                }
                 self.set_temp_status(result_status(
                     result,
                     "pane split",
@@ -1473,15 +1567,18 @@ impl App {
                     split_choice_at_mouse(mouse.column, mouse.row, self.screen_area)
                 {
                     choice.selected = split;
-                    let result = split_remote_pane(
+                    let (result, attach_target) = split_attach_result(split_remote_pane(
                         &choice.host,
                         &choice.pane,
                         choice.selected,
                         self.config.connect_timeout_secs,
                         self.config.log_path.as_deref(),
-                    );
+                    ));
                     self.mode = Mode::Normal;
                     self.request_refresh_host(choice.host.clone());
+                    if let Some(target) = attach_target {
+                        self.attach_request = Some(target);
+                    }
                     self.set_temp_status(result_status(
                         result,
                         "pane split",
@@ -1787,12 +1884,17 @@ fn create_remote_session(
     name: Option<&str>,
     connect_timeout_secs: u64,
     log_path: Option<&std::path::Path>,
-) -> Result<()> {
-    let remote_command = match name {
-        Some(name) => format!("tmux new-session -d -s {}", shell_quote(name)),
-        None => "tmux new-session -d".to_string(),
-    };
-    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
+) -> Result<AttachTarget> {
+    let mut remote_command = format!(
+        "tmux new-session -d -P -F {}",
+        shell_quote("#{session_name}")
+    );
+    if let Some(name) = name {
+        remote_command.push_str(" -s ");
+        remote_command.push_str(&shell_quote(name));
+    }
+    let output = run_remote_tmux_capture(host, &remote_command, connect_timeout_secs, log_path)?;
+    parse_created_session_target(host, &output)
 }
 
 fn create_remote_window(
@@ -1802,14 +1904,19 @@ fn create_remote_window(
     name: Option<&str>,
     connect_timeout_secs: u64,
     log_path: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<AttachTarget> {
     let target = after_window.unwrap_or(target);
-    let mut remote_command = format!("tmux new-window -a -t {}", shell_quote(&target));
+    let mut remote_command = format!(
+        "tmux new-window -a -P -F {} -t {}",
+        shell_quote("#{session_name}\t#{window_index}"),
+        shell_quote(&target)
+    );
     if let Some(name) = name {
         remote_command.push_str(" -n ");
         remote_command.push_str(&shell_quote(name));
     }
-    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
+    let output = run_remote_tmux_capture(host, &remote_command, connect_timeout_secs, log_path)?;
+    parse_created_window_target(host, &output)
 }
 
 fn split_remote_pane(
@@ -1818,13 +1925,18 @@ fn split_remote_pane(
     split: SplitChoice,
     connect_timeout_secs: u64,
     log_path: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<AttachTarget> {
     let flag = match split {
         SplitChoice::Vertical => "-v",
         SplitChoice::Horizontal => "-h",
     };
-    let remote_command = format!("tmux split-window {flag} -t {}", shell_quote(pane));
-    run_remote_tmux(host, &remote_command, connect_timeout_secs, log_path)
+    let remote_command = format!(
+        "tmux split-window {flag} -P -F {} -t {}",
+        shell_quote("#{session_name}\t#{window_index}\t#{pane_id}"),
+        shell_quote(pane)
+    );
+    let output = run_remote_tmux_capture(host, &remote_command, connect_timeout_secs, log_path)?;
+    parse_created_pane_target(host, &output)
 }
 
 fn rename_remote_session(
@@ -1911,6 +2023,25 @@ fn run_remote_tmux(
     connect_timeout_secs: u64,
     log_path: Option<&std::path::Path>,
 ) -> Result<()> {
+    run_remote_tmux_output(host, remote_command, connect_timeout_secs, log_path).map(|_| ())
+}
+
+fn run_remote_tmux_capture(
+    host: &str,
+    remote_command: &str,
+    connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
+) -> Result<String> {
+    let output = run_remote_tmux_output(host, remote_command, connect_timeout_secs, log_path)?;
+    String::from_utf8(output.stdout).context("remote tmux command output was not valid utf-8")
+}
+
+fn run_remote_tmux_output(
+    host: &str,
+    remote_command: &str,
+    connect_timeout_secs: u64,
+    log_path: Option<&std::path::Path>,
+) -> Result<Output> {
     log_remote_command_start(log_path, host, remote_command);
     let output = Command::new("ssh")
         .args(ssh_options(connect_timeout_secs))
@@ -1921,7 +2052,7 @@ fn run_remote_tmux(
     log_remote_command_output(log_path, host, remote_command, &output);
 
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1933,6 +2064,59 @@ fn run_remote_tmux(
             stderr
         }
     );
+}
+
+pub(crate) fn parse_created_session_target(host: &str, output: &str) -> Result<AttachTarget> {
+    let session = first_created_fields(output, 1)?
+        .into_iter()
+        .next()
+        .expect("field count already validated");
+    Ok(AttachTarget {
+        host: host.to_string(),
+        destination: AttachDestination::Session { session },
+    })
+}
+
+pub(crate) fn parse_created_window_target(host: &str, output: &str) -> Result<AttachTarget> {
+    let mut fields = first_created_fields(output, 2)?.into_iter();
+    let session = fields.next().expect("field count already validated");
+    let window = fields.next().expect("field count already validated");
+    Ok(AttachTarget {
+        host: host.to_string(),
+        destination: AttachDestination::Window { session, window },
+    })
+}
+
+pub(crate) fn parse_created_pane_target(host: &str, output: &str) -> Result<AttachTarget> {
+    let mut fields = first_created_fields(output, 3)?.into_iter();
+    let session = fields.next().expect("field count already validated");
+    let window = fields.next().expect("field count already validated");
+    let pane = fields.next().expect("field count already validated");
+    Ok(AttachTarget {
+        host: host.to_string(),
+        destination: AttachDestination::Pane {
+            session,
+            window,
+            pane,
+        },
+    })
+}
+
+fn first_created_fields(output: &str, expected_fields: usize) -> Result<Vec<String>> {
+    let line = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("remote tmux command did not print the created target")?;
+    let fields: Vec<String> = line.split('\t').map(str::to_string).collect();
+    if fields.len() < expected_fields
+        || fields
+            .iter()
+            .take(expected_fields)
+            .any(|field| field.is_empty())
+    {
+        bail!("remote tmux command returned an invalid created target: {line}");
+    }
+    Ok(fields)
 }
 
 fn optional_name(value: &str) -> Option<&str> {
@@ -2025,9 +2209,20 @@ fn pane_title_for(trees: &[HostTree], host: &str, pane_id: &str) -> Option<Strin
         .map(|pane| pane.pane_title.clone())
 }
 
-fn result_status(result: Result<()>, success: &str, log_path: Option<&std::path::Path>) -> String {
+fn split_attach_result(result: Result<AttachTarget>) -> (Result<()>, Option<AttachTarget>) {
     match result {
-        Ok(()) => success.to_string(),
+        Ok(target) => (Ok(()), Some(target)),
+        Err(err) => (Err(err), None),
+    }
+}
+
+fn result_status<T>(
+    result: Result<T>,
+    success: &str,
+    log_path: Option<&std::path::Path>,
+) -> String {
+    match result {
+        Ok(_) => success.to_string(),
         Err(err) => match log_path {
             Some(path) => format!("operation failed: {err}; see {}", path.display()),
             None => format!("operation failed: {err}"),

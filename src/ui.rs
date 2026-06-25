@@ -158,11 +158,7 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
     } else {
         parts.marker
     };
-    let marker_gap = if marker.is_empty() {
-        ""
-    } else {
-        " "
-    };
+    let marker_gap = if marker.is_empty() { "" } else { " " };
     let label_width_limit = if row.gpu_badges.is_empty() {
         u16::MAX
     } else {

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::app::{
     App, AttachDestination, ConfirmAction, ContextAction, ContextMenuItem, Mode, PageMode,
     PromptKind, RefreshRequest, SearchDirection, SplitChoice, attach_remote_command,
+    parse_created_pane_target, parse_created_session_target, parse_created_window_target,
 };
 use crate::config::{
     Config, DEFAULT_ACTIVE_PANE_LINE_TEXT, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_EXPAND_LEVEL,
@@ -381,6 +382,22 @@ fn context_menu_new_items_match_node_level() {
         .position(|row| matches!(row.id, NodeId::Pane { .. }))
         .unwrap();
     assert_eq!(new_item_labels(&app), vec!["new pane"]);
+
+    let mut active_tree = test_host_tree("t2");
+    active_tree.panes[0].busy_duration_secs = Some(42);
+    let mut active_app = test_app_with_tree(active_tree);
+    active_app
+        .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+    active_app.selected = active_app
+        .rows
+        .iter()
+        .position(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+    assert_eq!(
+        new_item_labels(&active_app),
+        vec!["new session", "new window", "new pane"]
+    );
 }
 
 #[test]
@@ -408,6 +425,41 @@ fn keyboard_create_on_session_opens_create_menu() {
 }
 
 #[test]
+fn keyboard_create_on_active_pane_opens_direct_split_menu() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut app = test_app_with_tree(tree);
+    app.tree_area = Rect::new(0, 0, 80, 10);
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+    app.selected = app
+        .rows
+        .iter()
+        .position(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    app.start_create();
+
+    let Mode::ContextMenu(menu) = &app.mode else {
+        panic!("expected create menu");
+    };
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .map(ContextMenuItem::display_label)
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "new session(s)",
+            "new window(w)",
+            "vertical split(v)",
+            "horizontal split(h)",
+        ]
+    );
+}
+
+#[test]
 fn keyboard_create_menu_shortcut_runs_selected_action() {
     let tree = test_host_tree("t2");
     let mut app = test_app_with_tree(tree);
@@ -426,6 +478,38 @@ fn keyboard_create_menu_shortcut_runs_selected_action() {
         panic!("expected prompt");
     };
     assert!(matches!(prompt.kind, PromptKind::CreateWindow { .. }));
+}
+
+#[test]
+fn active_pane_new_window_uses_owning_window_target() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut app = test_app_with_tree(tree);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+    app.selected = app
+        .rows
+        .iter()
+        .position(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    app.start_create_window();
+
+    let Mode::Prompt(prompt) = app.mode.clone() else {
+        panic!("expected prompt");
+    };
+    let PromptKind::CreateWindow {
+        host,
+        target,
+        after_window,
+    } = prompt.kind
+    else {
+        panic!("expected create window prompt");
+    };
+    assert_eq!(host, "t2");
+    assert_eq!(target, "$1");
+    assert_eq!(after_window.as_deref(), Some("@2"));
 }
 
 #[test]
@@ -622,6 +706,48 @@ fn pane_attach_remote_command_targets_pane_directly() {
     assert_eq!(command, "tmux attach-session -t 'main:2.%9'");
     assert!(!command.contains("switch-client"));
     assert!(!command.contains("new-session"));
+}
+
+#[test]
+fn parse_created_session_target_reads_tmux_output() {
+    let target = parse_created_session_target("t2", "scratch\n").unwrap();
+
+    assert_eq!(target.host, "t2");
+    assert_eq!(
+        target.destination,
+        AttachDestination::Session {
+            session: "scratch".to_string(),
+        }
+    );
+}
+
+#[test]
+fn parse_created_window_target_reads_tmux_output() {
+    let target = parse_created_window_target("t2", "main\t3\n").unwrap();
+
+    assert_eq!(target.host, "t2");
+    assert_eq!(
+        target.destination,
+        AttachDestination::Window {
+            session: "main".to_string(),
+            window: "3".to_string(),
+        }
+    );
+}
+
+#[test]
+fn parse_created_pane_target_reads_tmux_output() {
+    let target = parse_created_pane_target("t2", "main\t3\t%9\n").unwrap();
+
+    assert_eq!(target.host, "t2");
+    assert_eq!(
+        target.destination,
+        AttachDestination::Pane {
+            session: "main".to_string(),
+            window: "3".to_string(),
+            pane: "%9".to_string(),
+        }
+    );
 }
 
 #[test]
@@ -891,7 +1017,10 @@ fn collapse_user_shortens_home_prefixed_pane_values() {
         .find(|row| matches!(row.id, NodeId::Pane { .. }))
         .unwrap();
 
-    assert_eq!(pane_row.label, "~/code/train.py --epochs 1 ~/code ~/code/run");
+    assert_eq!(
+        pane_row.label,
+        "~/code/train.py --epochs 1 ~/code ~/code/run"
+    );
 }
 
 #[test]
@@ -900,7 +1029,10 @@ fn parse_process_cwds_reads_batched_pwdx_output() {
 
     let cwd_by_pid = parse_process_cwds(output);
 
-    assert_eq!(cwd_by_pid.get(&123).map(String::as_str), Some("/tmp/project"));
+    assert_eq!(
+        cwd_by_pid.get(&123).map(String::as_str),
+        Some("/tmp/project")
+    );
     assert_eq!(
         cwd_by_pid.get(&456).map(String::as_str),
         Some("/star-home/yelingxuan/code run")

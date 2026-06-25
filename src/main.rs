@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use app::{App, AttachDestination, AttachTarget, AutoRefresh, RefreshRequest, ScanTask, attach_host};
+use app::{
+    App, AttachDestination, AttachTarget, AutoRefresh, RefreshRequest, ScanTask, attach_host,
+};
 use clap::{Parser, Subcommand};
 use config::{Config, default_config_path, load_config};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -89,7 +91,9 @@ fn main() -> Result<()> {
                     window,
                     pane,
                 },
-                (Some(session), Some(window), None) => AttachDestination::Window { session, window },
+                (Some(session), Some(window), None) => {
+                    AttachDestination::Window { session, window }
+                }
                 (Some(session), None, None) => AttachDestination::Session { session },
                 (Some(_), None, Some(_)) => {
                     bail!("--pane requires --window");
@@ -103,10 +107,7 @@ fn main() -> Result<()> {
                 (None, None, None) => AttachDestination::Default,
             };
             attach_host(
-                &AttachTarget {
-                    host,
-                    destination,
-                },
+                &AttachTarget { host, destination },
                 config.connect_timeout_secs,
             )?;
         }
