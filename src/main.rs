@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use app::{App, AutoRefresh, RefreshRequest, ScanTask, attach_host};
+use app::{App, AttachDestination, AttachTarget, AutoRefresh, RefreshRequest, ScanTask, attach_host};
 use clap::{Parser, Subcommand};
 use config::{Config, default_config_path, load_config};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -83,11 +83,30 @@ fn main() -> Result<()> {
             pane,
         }) => {
             ensure_configured_host(&config, &host)?;
+            let destination = match (session, window, pane) {
+                (Some(session), Some(window), Some(pane)) => AttachDestination::Pane {
+                    session,
+                    window,
+                    pane,
+                },
+                (Some(session), Some(window), None) => AttachDestination::Window { session, window },
+                (Some(session), None, None) => AttachDestination::Session { session },
+                (Some(_), None, Some(_)) => {
+                    bail!("--pane requires --window");
+                }
+                (None, Some(_), _) => {
+                    bail!("--window requires --session");
+                }
+                (None, None, Some(_)) => {
+                    bail!("--pane requires --session and --window");
+                }
+                (None, None, None) => AttachDestination::Default,
+            };
             attach_host(
-                &host,
-                session.as_deref(),
-                window.as_deref(),
-                pane.as_deref(),
+                &AttachTarget {
+                    host,
+                    destination,
+                },
                 config.connect_timeout_secs,
             )?;
         }
@@ -153,13 +172,7 @@ fn run_tui(config: Config) -> Result<()> {
             disable_raw_mode()?;
             execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
 
-            let result = attach_host(
-                &target.host,
-                Some(&target.session),
-                Some(&target.window),
-                Some(&target.pane),
-                app.config.connect_timeout_secs,
-            );
+            let result = attach_host(&target, app.config.connect_timeout_secs);
 
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use crate::app::{App, ContextMenuItem, ContextMenuState, Mode, SplitChoice, prompt_help};
 #[cfg(test)]
 use crate::model::NodeId;
-use crate::model::{GpuBadge, RowStatus, VisibleRow};
+use crate::model::{GpuBadge, RowLabelSpan, RowStatus, VisibleRow};
 
 pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -29,7 +29,7 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         ),
         Span::raw("  "),
         Span::styled(
-            "server / session / window / pane",
+            app.page_mode.subtitle(),
             Style::default().fg(Color::DarkGray),
         ),
     ]))
@@ -111,7 +111,11 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("tree"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(app.page_mode.title()),
+    );
     frame.render_widget(list, chunks[1]);
 
     let status_text = if matches!(app.mode, Mode::Search) {
@@ -143,38 +147,57 @@ struct RowRenderParts {
 }
 
 fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
+    let label_width_limit = if row.gpu_badges.is_empty() {
+        u16::MAX
+    } else {
+        let fixed_width = parts.cursor.chars().count() as u16
+            + parts.indent.chars().count() as u16
+            + parts.marker.chars().count() as u16
+            + 2;
+        let badge_width = gpu_badges_width(&row.gpu_badges);
+        let badge_gap = if badge_width > 0 { 1 } else { 0 };
+        parts
+            .width
+            .saturating_sub(fixed_width)
+            .saturating_sub(badge_width)
+            .saturating_sub(badge_gap)
+    };
+    let trimmed_label_spans = trim_label_spans(&row.label_spans, label_width_limit);
+    let trimmed_label = spans_plain_text(&trimmed_label_spans);
+
     if row.gpu_badges.is_empty() {
-        return Line::from(vec![
+        let mut spans = vec![
             Span::styled(parts.cursor, parts.row_style),
             Span::raw(parts.indent),
             Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
             Span::raw(" "),
-            Span::styled(row.label.clone(), parts.main_style),
-            Span::raw(" "),
-            Span::styled(row.detail.clone(), parts.detail_style),
-        ]);
+        ];
+        spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(row.detail.clone(), parts.detail_style));
+        return Line::from(spans);
     }
 
     let fixed_width = parts.cursor.chars().count() as u16
         + parts.indent.chars().count() as u16
         + parts.marker.chars().count() as u16
         + 2;
-    let badge_width = row.gpu_badges.len() as u16;
+    let badge_width = gpu_badges_width(&row.gpu_badges);
     let badge_gap = if badge_width > 0 { 1 } else { 0 };
     let text_width = parts
         .width
         .saturating_sub(fixed_width)
         .saturating_sub(badge_width)
         .saturating_sub(badge_gap);
-    let (label, detail) = trim_row_text(&row.label, &row.detail, text_width);
+    let (_, detail) = trim_row_text(&trimmed_label, &row.detail, text_width);
 
     let mut spans = vec![
         Span::styled(parts.cursor, parts.row_style),
         Span::raw(parts.indent),
         Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
         Span::raw(" "),
-        Span::styled(label.clone(), parts.main_style),
     ];
+    spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
     if !detail.is_empty() {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(detail.clone(), parts.detail_style));
@@ -194,12 +217,14 @@ fn add_right_aligned_gpu_badges(
         return;
     }
 
-    let badge_width = row.gpu_badges.len() as u16;
+    let badge_width = gpu_badges_width(&row.gpu_badges);
     let actual_left_width = line_width(spans);
     let left_width = actual_left_width.min(reserved_left_width);
     let gap = width.saturating_sub(left_width).saturating_sub(badge_width);
     spans.push(Span::raw(" ".repeat(gap as usize)));
-    spans.extend(row.gpu_badges.iter().map(gpu_badge_span));
+    for badge in &row.gpu_badges {
+        spans.extend(gpu_badge_spans(badge));
+    }
 }
 
 fn trim_row_text(label: &str, detail: &str, width: u16) -> (String, String) {
@@ -220,6 +245,48 @@ fn trim_to_width(value: &str, width: u16) -> String {
     value.chars().take(width as usize).collect()
 }
 
+fn trim_label_spans(spans: &[RowLabelSpan], width: u16) -> Vec<RowLabelSpan> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if width == u16::MAX {
+        return spans.to_vec();
+    }
+
+    let mut remaining = width as usize;
+    let mut trimmed = Vec::new();
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_len = span.text.chars().count();
+        let take_len = span_len.min(remaining);
+        trimmed.push(RowLabelSpan {
+            text: span.text.chars().take(take_len).collect(),
+            fg: span.fg,
+        });
+        remaining -= take_len;
+    }
+    trimmed
+}
+
+fn styled_label_spans(spans: &[RowLabelSpan], base_style: Style) -> Vec<Span<'static>> {
+    spans
+        .iter()
+        .map(|span| {
+            let style = match span.fg {
+                Some(color) => base_style.patch(Style::default().fg(color)),
+                None => base_style,
+            };
+            Span::styled(span.text.clone(), style)
+        })
+        .collect()
+}
+
+fn spans_plain_text(spans: &[RowLabelSpan]) -> String {
+    spans.iter().map(|span| span.text.as_str()).collect()
+}
+
 fn line_width(spans: &[Span<'_>]) -> u16 {
     spans
         .iter()
@@ -227,14 +294,25 @@ fn line_width(spans: &[Span<'_>]) -> u16 {
         .sum()
 }
 
-fn gpu_badge_span(badge: &GpuBadge) -> Span<'static> {
+fn gpu_badges_width(badges: &[GpuBadge]) -> u16 {
+    badges.iter().map(gpu_badge_width).sum()
+}
+
+fn gpu_badge_width(badge: &GpuBadge) -> u16 {
+    match badge {
+        GpuBadge::Memory { .. } => 1,
+        GpuBadge::ActivePaneMemory { .. } => 1,
+    }
+}
+
+fn gpu_badge_spans(badge: &GpuBadge) -> Vec<Span<'static>> {
     match badge {
         GpuBadge::Memory {
             digit,
             level,
             active,
             placeholder,
-        } => Span::styled(
+        } => vec![Span::styled(
             digit.to_string(),
             Style::default()
                 .fg(gpu_badge_foreground(*active))
@@ -245,7 +323,30 @@ fn gpu_badge_span(badge: &GpuBadge) -> Span<'static> {
                 } else {
                     gpu_memory_color(*level)
                 }),
-        ),
+        )],
+        GpuBadge::ActivePaneMemory {
+            digit,
+            level,
+            pane_active,
+        } => vec![Span::styled(
+            digit.to_string(),
+            Style::default()
+                .fg(if *pane_active {
+                    Color::White
+                } else {
+                    gpu_badge_foreground(false)
+                })
+                .bg(if *pane_active {
+                    Color::Blue
+                } else {
+                    gpu_memory_color(*level)
+                })
+                .add_modifier(if *pane_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )],
     }
 }
 

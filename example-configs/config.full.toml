@@ -17,6 +17,10 @@ mouse_scroll_lines = 5
 # Set to 0 to disable automatic refresh.
 auto_refresh_secs = 15
 
+# Collapse a leading $HOME prefix to ~ in template values such as
+# {pane_commandline} and {pane_current_path}.
+collapse_user = true
+
 # Optional diagnostic log path.
 # By default no log file is written.
 # Uncomment this when debugging failed remote tmux operations.
@@ -29,17 +33,24 @@ auto_refresh_secs = 15
 # pane    = show the full tree
 default_expand_level = "server"
 
+# Initial page shown at startup.
+# tree   = hierarchical server/session/window/pane view
+# active = flat view of panes with running processes
+start_page = "tree"
+
 # Server row format.
 # Placeholders:
 # {server_name} {host} {session_count} {window_count} {pane_count}
 # {process_status} {process_elapsed_time}
+# You can color a placeholder with {name:blue} or {name:#RRGGBB}.
+# Explicit template colors override the default text foreground for that field only.
 server_line_text = "[Server] {server_name}"
 
 # Session row format.
 # Placeholders:
 # {server_name} {host} {session_name} {window_count} {pane_count}
 # {session_uptime} {process_status} {process_elapsed_time}
-session_line_text = "[Session] {session_name}"
+session_line_text = "[Session] {session_name:cyan}"
 
 # Window row format.
 # Placeholders:
@@ -55,3 +66,7 @@ window_line_text = "[Window] {is_active}{window_index}: {window_name}"
 # {pane_commandline} {pane_current_path} {pane_title} {pane_title_prefix} {is_active}
 # {session_uptime} {window_uptime} {pane_uptime} {process_status} {process_elapsed_time}
 pane_line_text = "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}"
+
+# Active pane flat-page row format.
+# Uses the same placeholders as pane_line_text, but is configured independently.
+active_pane_line_text = "[Active] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_current_path} {pane_commandline}"

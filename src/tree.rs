@@ -2,9 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ratatui::style::Color;
+
 use crate::app::SearchDirection;
 use crate::config::LineFormats;
-use crate::model::{GpuBadge, HostTree, NodeId, PaneInfo, RowStatus, VisibleRow};
+use crate::model::{GpuBadge, HostTree, NodeId, PaneInfo, RowLabelSpan, RowStatus, VisibleRow};
+
+#[derive(Clone, Debug)]
+struct RenderedLine {
+    plain: String,
+    spans: Vec<RowLabelSpan>,
+}
 
 pub(crate) fn build_rows(
     trees: &[HostTree],
@@ -17,10 +25,12 @@ pub(crate) fn build_rows(
     for tree in trees {
         let host_id = NodeId::Host(tree.host.clone());
         let detail = host_detail(tree);
+        let label = format_server_line(tree, line_formats);
         rows.push(VisibleRow {
             id: host_id.clone(),
             depth: 0,
-            label: format_server_line(tree, line_formats),
+            label: label.plain,
+            label_spans: label.spans,
             detail: detail.clone(),
             search_text: format!("{} {}", tree.host, detail),
             selectable: false,
@@ -50,16 +60,13 @@ pub(crate) fn build_rows(
                 host: tree.host.clone(),
                 session: session_name.clone(),
             };
+            let label =
+                format_session_line(tree, &session_name, windows.len(), line_formats, now_epoch);
             rows.push(VisibleRow {
                 id: session_id.clone(),
                 depth: 1,
-                label: format_session_line(
-                    tree,
-                    &session_name,
-                    windows.len(),
-                    line_formats,
-                    now_epoch,
-                ),
+                label: label.plain,
+                label_spans: label.spans,
                 detail: format!("{} windows", windows.len()),
                 search_text: session_name.clone(),
                 selectable: false,
@@ -84,17 +91,19 @@ pub(crate) fn build_rows(
                     session: session_name.clone(),
                     window: window_index.clone(),
                 };
+                let label = format_window_line(
+                    &tree.host,
+                    &session_name,
+                    &window_index,
+                    &panes,
+                    line_formats,
+                    now_epoch,
+                );
                 rows.push(VisibleRow {
                     id: window_id.clone(),
                     depth: 2,
-                    label: format_window_line(
-                        &tree.host,
-                        &session_name,
-                        &window_index,
-                        &panes,
-                        line_formats,
-                        now_epoch,
-                    ),
+                    label: label.plain,
+                    label_spans: label.spans,
                     detail: format!("{} panes", panes.len()),
                     search_text: format!("{} {}", window_index, first.window_name),
                     selectable: true,
@@ -119,17 +128,20 @@ pub(crate) fn build_rows(
                         window: window_index.clone(),
                         pane: pane.pane_id.clone(),
                     };
+                    let label = format_pane_line(
+                        &tree.host,
+                        &session_name,
+                        &window_index,
+                        pane,
+                        &line_formats.pane,
+                        now_epoch,
+                        line_formats,
+                    );
                     rows.push(VisibleRow {
                         id: pane_id,
                         depth: 3,
-                        label: format_pane_line(
-                            &tree.host,
-                            &session_name,
-                            &window_index,
-                            pane,
-                            line_formats,
-                            now_epoch,
-                        ),
+                        label: label.plain,
+                        label_spans: label.spans,
                         detail: String::new(),
                         search_text: format!(
                             "{} {} {} {}",
@@ -146,6 +158,61 @@ pub(crate) fn build_rows(
                     });
                 }
             }
+        }
+    }
+
+    rows
+}
+
+pub(crate) fn build_active_pane_rows(
+    trees: &[HostTree],
+    line_formats: &LineFormats,
+) -> Vec<VisibleRow> {
+    let mut rows = Vec::new();
+    let now_epoch = current_unix_epoch();
+
+    for tree in trees {
+        for pane in tree
+            .panes
+            .iter()
+            .filter(|pane| pane.busy_duration_secs.is_some())
+        {
+            let label = format_pane_line(
+                &tree.host,
+                &pane.session_name,
+                &pane.window_index,
+                pane,
+                &line_formats.active_pane,
+                now_epoch,
+                line_formats,
+            );
+            rows.push(VisibleRow {
+                id: NodeId::Pane {
+                    host: tree.host.clone(),
+                    session: pane.session_name.clone(),
+                    window: pane.window_index.clone(),
+                    pane: pane.pane_id.clone(),
+                },
+                depth: 0,
+                label: label.plain,
+                label_spans: label.spans,
+                detail: String::new(),
+                search_text: format!(
+                    "{} {} {} {} {} {} {}",
+                    tree.host,
+                    pane.session_name,
+                    pane.window_index,
+                    pane.pane_index,
+                    pane.pane_id,
+                    pane.pane_current_command,
+                    pane.pane_commandline
+                ),
+                selectable: true,
+                expandable: false,
+                status: RowStatus::Normal,
+                busy_duration_secs: pane.busy_duration_secs,
+                gpu_badges: active_pane_gpu_badges(&tree.gpus, pane),
+            });
         }
     }
 
@@ -187,19 +254,34 @@ pub(crate) fn expandable_node_ids(trees: &[HostTree]) -> BTreeSet<NodeId> {
     ids
 }
 
-fn format_server_line(tree: &HostTree, line_formats: &LineFormats) -> String {
+fn format_server_line(tree: &HostTree, line_formats: &LineFormats) -> RenderedLine {
     let sessions = group_tree(tree);
     let window_count: usize = sessions.values().map(BTreeMap::len).sum();
     let pane_count = tree.panes.len();
     let busy_duration = max_busy_duration(tree.panes.iter());
     let mut values = BTreeMap::new();
-    values.insert("server_name", tree.host.clone());
-    values.insert("host", tree.host.clone());
-    values.insert("session_count", sessions.len().to_string());
-    values.insert("window_count", window_count.to_string());
-    values.insert("pane_count", pane_count.to_string());
-    insert_process_values(&mut values, busy_duration);
-    format_line(&line_formats.server, &values)
+    insert_template_value(&mut values, "server_name", tree.host.clone(), line_formats);
+    insert_template_value(&mut values, "host", tree.host.clone(), line_formats);
+    insert_template_value(
+        &mut values,
+        "session_count",
+        sessions.len().to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "window_count",
+        window_count.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_count",
+        pane_count.to_string(),
+        line_formats,
+    );
+    insert_process_values(&mut values, busy_duration, line_formats);
+    render_line(&line_formats.server, &values)
 }
 
 fn format_session_line(
@@ -208,7 +290,7 @@ fn format_session_line(
     window_count: usize,
     line_formats: &LineFormats,
     now_epoch: u64,
-) -> String {
+) -> RenderedLine {
     let panes: Vec<&PaneInfo> = tree
         .panes
         .iter()
@@ -216,20 +298,37 @@ fn format_session_line(
         .collect();
     let busy_duration = max_busy_duration(panes.iter().copied());
     let mut values = BTreeMap::new();
-    values.insert("server_name", tree.host.clone());
-    values.insert("host", tree.host.clone());
-    values.insert("session_name", session_name.to_string());
-    values.insert(
+    insert_template_value(&mut values, "server_name", tree.host.clone(), line_formats);
+    insert_template_value(&mut values, "host", tree.host.clone(), line_formats);
+    insert_template_value(
+        &mut values,
+        "session_name",
+        session_name.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "session_uptime",
         uptime_value(
             min_created_epoch(panes.iter().map(|pane| pane.session_created)),
             now_epoch,
         ),
+        line_formats,
     );
-    values.insert("window_count", window_count.to_string());
-    values.insert("pane_count", panes.len().to_string());
-    insert_process_values(&mut values, busy_duration);
-    format_line(&line_formats.session, &values)
+    insert_template_value(
+        &mut values,
+        "window_count",
+        window_count.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_count",
+        panes.len().to_string(),
+        line_formats,
+    );
+    insert_process_values(&mut values, busy_duration, line_formats);
+    render_line(&line_formats.session, &values)
 }
 
 fn format_window_line(
@@ -239,36 +338,62 @@ fn format_window_line(
     panes: &[&PaneInfo],
     line_formats: &LineFormats,
     now_epoch: u64,
-) -> String {
+) -> RenderedLine {
     let first = panes[0];
     let busy_duration = max_busy_duration(panes.iter().copied());
     let mut values = BTreeMap::new();
-    values.insert("server_name", host.to_string());
-    values.insert("host", host.to_string());
-    values.insert("session_name", session_name.to_string());
-    values.insert(
+    insert_template_value(&mut values, "server_name", host.to_string(), line_formats);
+    insert_template_value(&mut values, "host", host.to_string(), line_formats);
+    insert_template_value(
+        &mut values,
+        "session_name",
+        session_name.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "session_uptime",
         uptime_value(
             min_created_epoch(panes.iter().map(|pane| pane.session_created)),
             now_epoch,
         ),
+        line_formats,
     );
-    values.insert("window_index", window_index.to_string());
-    values.insert(
+    insert_template_value(
+        &mut values,
+        "window_index",
+        window_index.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "window_uptime",
         uptime_value(
             min_created_epoch(panes.iter().map(|pane| pane.window_created)),
             now_epoch,
         ),
+        line_formats,
     );
-    values.insert("window_name", first.window_name.clone());
-    values.insert("window_panes", panes.len().to_string());
-    values.insert(
+    insert_template_value(
+        &mut values,
+        "window_name",
+        first.window_name.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "window_panes",
+        panes.len().to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "is_active",
         if first.active_window { "*" } else { " " }.to_string(),
+        line_formats,
     );
-    insert_process_values(&mut values, busy_duration);
-    format_line(&line_formats.window, &values)
+    insert_process_values(&mut values, busy_duration, line_formats);
+    render_line(&line_formats.window, &values)
 }
 
 fn format_pane_line(
@@ -276,46 +401,110 @@ fn format_pane_line(
     session_name: &str,
     window_index: &str,
     pane: &PaneInfo,
-    line_formats: &LineFormats,
+    template: &str,
     now_epoch: u64,
-) -> String {
+    line_formats: &LineFormats,
+) -> RenderedLine {
     let mut values = BTreeMap::new();
-    values.insert("server_name", host.to_string());
-    values.insert("host", host.to_string());
-    values.insert("session_name", session_name.to_string());
-    values.insert(
+    insert_template_value(&mut values, "server_name", host.to_string(), line_formats);
+    insert_template_value(&mut values, "host", host.to_string(), line_formats);
+    insert_template_value(
+        &mut values,
+        "session_name",
+        session_name.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "session_uptime",
         uptime_value(pane.session_created, now_epoch),
+        line_formats,
     );
-    values.insert("window_index", window_index.to_string());
-    values.insert(
+    insert_template_value(
+        &mut values,
+        "window_index",
+        window_index.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "window_uptime",
         uptime_value(pane.window_created, now_epoch),
+        line_formats,
     );
-    values.insert("window_name", pane.window_name.clone());
-    values.insert("pane_index", pane.pane_index.clone());
-    values.insert("pane_id", pane.pane_id.clone());
-    values.insert("pane_uptime", uptime_value(pane.pane_created, now_epoch));
-    values.insert("pane_pid", pane.pane_pid.to_string());
-    values.insert("pane_current_command", pane.pane_current_command.clone());
-    values.insert("pane_command", pane.pane_current_command.clone());
-    values.insert("pane_commandline", pane.pane_commandline.clone());
-    values.insert("pane_current_path", pane.pane_current_path.clone());
-    values.insert("pane_title", pane.pane_title.clone());
-    values.insert(
+    insert_template_value(
+        &mut values,
+        "window_name",
+        pane.window_name.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_index",
+        pane.pane_index.clone(),
+        line_formats,
+    );
+    insert_template_value(&mut values, "pane_id", pane.pane_id.clone(), line_formats);
+    insert_template_value(
+        &mut values,
+        "pane_uptime",
+        uptime_value(pane.pane_created, now_epoch),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_pid",
+        pane.pane_pid.to_string(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_current_command",
+        pane.pane_current_command.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_command",
+        pane.pane_current_command.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_commandline",
+        pane.pane_commandline.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_current_path",
+        pane.pane_current_path.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
+        "pane_title",
+        pane.pane_title.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "pane_title_prefix",
         if pane.pane_title.is_empty() {
             String::new()
         } else {
             format!(" - {}", pane.pane_title)
         },
+        line_formats,
     );
-    values.insert(
+    insert_template_value(
+        &mut values,
         "is_active",
         if pane.active_pane { "*" } else { " " }.to_string(),
+        line_formats,
     );
-    insert_process_values(&mut values, pane.busy_duration_secs);
-    format_line(&line_formats.pane, &values)
+    insert_process_values(&mut values, pane.busy_duration_secs, line_formats);
+    render_line(template, &values)
 }
 
 fn current_unix_epoch() -> u64 {
@@ -335,50 +524,186 @@ fn uptime_value(created_epoch: Option<u64>, now_epoch: u64) -> String {
         .unwrap_or_default()
 }
 
-fn insert_process_values(values: &mut BTreeMap<&'static str, String>, duration: Option<u64>) {
+fn insert_process_values(
+    values: &mut BTreeMap<&'static str, String>,
+    duration: Option<u64>,
+    line_formats: &LineFormats,
+) {
     let (status, elapsed) = match duration {
         Some(seconds) => ("running".to_string(), human_duration(seconds)),
         None => (String::new(), String::new()),
     };
-    values.insert("process_status", status);
-    values.insert("process_elapsed_time", elapsed);
+    insert_template_value(values, "process_status", status, line_formats);
+    insert_template_value(values, "process_elapsed_time", elapsed, line_formats);
 }
 
 pub(crate) fn format_line(template: &str, values: &BTreeMap<&'static str, String>) -> String {
+    render_line(template, values).plain
+}
+
+fn render_line(template: &str, values: &BTreeMap<&'static str, String>) -> RenderedLine {
     let mut output = String::new();
+    let mut spans = Vec::new();
     let mut chars = template.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch != '{' {
             output.push(ch);
+            push_row_span(&mut spans, ch.to_string(), None);
             continue;
         }
 
-        let mut key = String::new();
+        let mut placeholder = String::new();
         let mut closed = false;
         for next in chars.by_ref() {
             if next == '}' {
                 closed = true;
                 break;
             }
-            key.push(next);
+            placeholder.push(next);
         }
 
         if closed {
-            if let Some(value) = values.get(key.as_str()) {
+            let (key, color) = split_placeholder(&placeholder);
+            if let Some(value) = values.get(key) {
                 output.push_str(value);
+                push_row_span(&mut spans, value.clone(), color.and_then(parse_color_spec));
             } else {
                 output.push('{');
-                output.push_str(&key);
+                output.push_str(&placeholder);
                 output.push('}');
+                push_row_span(&mut spans, format!("{{{placeholder}}}"), None);
             }
         } else {
             output.push('{');
-            output.push_str(&key);
+            output.push_str(&placeholder);
+            push_row_span(&mut spans, format!("{{{placeholder}"), None);
         }
     }
 
-    output.trim_end().to_string()
+    trim_rendered_line_end(RenderedLine {
+        plain: output,
+        spans,
+    })
+}
+
+fn insert_template_value(
+    values: &mut BTreeMap<&'static str, String>,
+    key: &'static str,
+    value: String,
+    line_formats: &LineFormats,
+) {
+    values.insert(key, collapse_user_prefix(&value, line_formats));
+}
+
+fn collapse_user_prefix(value: &str, line_formats: &LineFormats) -> String {
+    if !line_formats.collapse_user {
+        return value.to_string();
+    }
+
+    let Some(home) = line_formats.user_home.as_deref() else {
+        return value.to_string();
+    };
+
+    if value == home {
+        return "~".to_string();
+    }
+
+    let Some(suffix) = value.strip_prefix(home) else {
+        return value.to_string();
+    };
+
+    if suffix.is_empty() || suffix.starts_with('/') {
+        return format!("~{suffix}");
+    }
+
+    value.to_string()
+}
+
+fn split_placeholder(placeholder: &str) -> (&str, Option<&str>) {
+    match placeholder.split_once(':') {
+        Some((key, color)) if !key.is_empty() => (key, Some(color)),
+        _ => (placeholder, None),
+    }
+}
+
+fn parse_color_spec(spec: &str) -> Option<Color> {
+    let spec = spec.trim();
+    if let Some(hex) = spec.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+
+    match spec.to_ascii_lowercase().as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "gray" | "grey" => Some(Color::Gray),
+        "darkgray" | "darkgrey" => Some(Color::DarkGray),
+        "lightred" => Some(Color::LightRed),
+        "lightgreen" => Some(Color::LightGreen),
+        "lightyellow" => Some(Color::LightYellow),
+        "lightblue" => Some(Color::LightBlue),
+        "lightmagenta" => Some(Color::LightMagenta),
+        "lightcyan" => Some(Color::LightCyan),
+        _ => None,
+    }
+}
+
+fn push_row_span(spans: &mut Vec<RowLabelSpan>, text: String, fg: Option<Color>) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = spans.last_mut()
+        && last.fg == fg
+    {
+        last.text.push_str(&text);
+        return;
+    }
+
+    spans.push(RowLabelSpan { text, fg });
+}
+
+fn trim_rendered_line_end(mut rendered: RenderedLine) -> RenderedLine {
+    let trailing_chars = rendered
+        .plain
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_whitespace())
+        .count();
+    if trailing_chars == 0 {
+        return rendered;
+    }
+
+    rendered.plain = rendered.plain.trim_end().to_string();
+    let mut remaining = trailing_chars;
+    while remaining > 0 {
+        let Some(last) = rendered.spans.last_mut() else {
+            break;
+        };
+        let span_len = last.text.chars().count();
+        if span_len <= remaining {
+            remaining -= span_len;
+            rendered.spans.pop();
+            continue;
+        }
+        let keep = span_len - remaining;
+        last.text = last.text.chars().take(keep).collect();
+        break;
+    }
+
+    rendered
 }
 
 pub(crate) fn group_tree(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> {
@@ -444,6 +769,32 @@ fn process_gpu_badges<'a>(
                 level: decile_level(decile),
                 active: true,
                 placeholder: false,
+            }
+        })
+        .collect()
+}
+
+fn active_pane_gpu_badges(gpus: &[crate::model::GpuInfo], pane: &PaneInfo) -> Vec<GpuBadge> {
+    let pane_memory_by_index: BTreeMap<usize, u64> =
+        pane.gpu_memory_by_index.iter().copied().collect();
+
+    gpus.iter()
+        .map(|gpu| {
+            let total_decile = rounded_memory_decile(gpu.memory_used_mib, gpu.memory_total_mib);
+            match pane_memory_by_index.get(&gpu.index) {
+                Some(memory_used_mib) => GpuBadge::ActivePaneMemory {
+                    digit: decile_digit(rounded_memory_decile(
+                        *memory_used_mib,
+                        gpu.memory_total_mib,
+                    )),
+                    level: decile_level(total_decile),
+                    pane_active: true,
+                },
+                None => GpuBadge::ActivePaneMemory {
+                    digit: decile_digit(total_decile),
+                    level: decile_level(total_decile),
+                    pane_active: false,
+                },
             }
         })
         .collect()

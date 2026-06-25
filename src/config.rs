@@ -11,12 +11,15 @@ const DEFAULT_SCAN_CONCURRENCY: usize = 32;
 pub(crate) const DEFAULT_MOUSE_SCROLL_LINES: usize = 5;
 pub(crate) const DEFAULT_AUTO_REFRESH_SECS: u64 = 15;
 pub(crate) const DEFAULT_EXPAND_LEVEL: ExpandLevel = ExpandLevel::Server;
+pub(crate) const DEFAULT_START_PAGE: StartPage = StartPage::Tree;
+pub(crate) const DEFAULT_COLLAPSE_USER: bool = true;
 pub(crate) const DEFAULT_SERVER_LINE_TEXT: &str = "[Server] {server_name}";
 pub(crate) const DEFAULT_SESSION_LINE_TEXT: &str = "[Session] {session_name}";
 pub(crate) const DEFAULT_WINDOW_LINE_TEXT: &str =
     "[Window] {is_active}{window_index}: {window_name}";
 pub(crate) const DEFAULT_PANE_LINE_TEXT: &str =
     "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}";
+pub(crate) const DEFAULT_ACTIVE_PANE_LINE_TEXT: &str = "[Active] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_commandline}";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawConfig {
@@ -26,11 +29,14 @@ pub(crate) struct RawConfig {
     pub(crate) mouse_scroll_lines: Option<usize>,
     pub(crate) auto_refresh_secs: Option<u64>,
     pub(crate) default_expand_level: Option<String>,
+    pub(crate) start_page: Option<String>,
+    pub(crate) collapse_user: Option<bool>,
     pub(crate) log_path: Option<PathBuf>,
     pub(crate) server_line_text: Option<String>,
     pub(crate) session_line_text: Option<String>,
     pub(crate) window_line_text: Option<String>,
     pub(crate) pane_line_text: Option<String>,
+    pub(crate) active_pane_line_text: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +47,8 @@ pub(crate) struct Config {
     pub(crate) mouse_scroll_lines: usize,
     pub(crate) auto_refresh_secs: u64,
     pub(crate) default_expand_level: ExpandLevel,
+    pub(crate) start_page: StartPage,
+    pub(crate) collapse_user: bool,
     pub(crate) log_path: Option<PathBuf>,
     pub(crate) line_formats: LineFormats,
 }
@@ -53,12 +61,21 @@ pub(crate) enum ExpandLevel {
     Pane,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartPage {
+    Tree,
+    Active,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LineFormats {
     pub(crate) server: String,
     pub(crate) session: String,
     pub(crate) window: String,
     pub(crate) pane: String,
+    pub(crate) active_pane: String,
+    pub(crate) collapse_user: bool,
+    pub(crate) user_home: Option<String>,
 }
 
 pub(crate) fn default_config_path() -> PathBuf {
@@ -121,6 +138,9 @@ pub(crate) fn normalize_config(raw: RawConfig) -> Result<Config> {
         .max(1);
     let auto_refresh_secs = raw.auto_refresh_secs.unwrap_or(DEFAULT_AUTO_REFRESH_SECS);
     let default_expand_level = parse_expand_level(raw.default_expand_level.as_deref())?;
+    let start_page = parse_start_page(raw.start_page.as_deref())?;
+    let collapse_user = raw.collapse_user.unwrap_or(DEFAULT_COLLAPSE_USER);
+    let user_home = std::env::var("HOME").ok();
 
     Ok(Config {
         hosts: dedup_hosts(hosts),
@@ -129,6 +149,8 @@ pub(crate) fn normalize_config(raw: RawConfig) -> Result<Config> {
         mouse_scroll_lines,
         auto_refresh_secs,
         default_expand_level,
+        start_page,
+        collapse_user,
         log_path: raw.log_path,
         line_formats: LineFormats {
             server: raw
@@ -143,6 +165,11 @@ pub(crate) fn normalize_config(raw: RawConfig) -> Result<Config> {
             pane: raw
                 .pane_line_text
                 .unwrap_or_else(|| DEFAULT_PANE_LINE_TEXT.to_string()),
+            active_pane: raw
+                .active_pane_line_text
+                .unwrap_or_else(|| DEFAULT_ACTIVE_PANE_LINE_TEXT.to_string()),
+            collapse_user,
+            user_home,
         },
     })
 }
@@ -160,6 +187,18 @@ fn parse_expand_level(value: Option<&str>) -> Result<ExpandLevel> {
         other => bail!(
             "unsupported default_expand_level {other:?}; expected server, session, window, or pane"
         ),
+    }
+}
+
+fn parse_start_page(value: Option<&str>) -> Result<StartPage> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_START_PAGE);
+    };
+
+    match value.trim().to_lowercase().as_str() {
+        "tree" => Ok(StartPage::Tree),
+        "active" => Ok(StartPage::Active),
+        other => bail!("unsupported start_page {other:?}; expected tree or active"),
     }
 }
 

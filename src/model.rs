@@ -1,3 +1,5 @@
+use ratatui::style::Color;
+
 #[derive(Clone, Debug)]
 pub(crate) struct PaneInfo {
     pub(crate) session_name: String,
@@ -54,6 +56,11 @@ pub(crate) enum GpuBadge {
         active: bool,
         placeholder: bool,
     },
+    ActivePaneMemory {
+        digit: char,
+        level: u8,
+        pane_active: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -103,10 +110,17 @@ pub(crate) enum NodeId {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RowLabelSpan {
+    pub(crate) text: String,
+    pub(crate) fg: Option<Color>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct VisibleRow {
     pub(crate) id: NodeId,
     pub(crate) depth: usize,
     pub(crate) label: String,
+    pub(crate) label_spans: Vec<RowLabelSpan>,
     pub(crate) detail: String,
     pub(crate) search_text: String,
     pub(crate) selectable: bool,

@@ -3,14 +3,14 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    App, ConfirmAction, ContextAction, ContextMenuItem, Mode, PromptKind, RefreshRequest,
-    SearchDirection, SplitChoice,
+    App, AttachDestination, ConfirmAction, ContextAction, ContextMenuItem, Mode, PageMode,
+    PromptKind, RefreshRequest, SearchDirection, SplitChoice, attach_remote_command,
 };
 use crate::config::{
-    Config, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_EXPAND_LEVEL, DEFAULT_MOUSE_SCROLL_LINES,
-    DEFAULT_PANE_LINE_TEXT, DEFAULT_SERVER_LINE_TEXT, DEFAULT_SESSION_LINE_TEXT,
-    DEFAULT_WINDOW_LINE_TEXT, ExpandLevel, LineFormats, RawConfig, load_config, normalize_config,
-    parse_ssh_config_hosts,
+    Config, DEFAULT_ACTIVE_PANE_LINE_TEXT, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_EXPAND_LEVEL,
+    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_PANE_LINE_TEXT, DEFAULT_SERVER_LINE_TEXT,
+    DEFAULT_SESSION_LINE_TEXT, DEFAULT_START_PAGE, DEFAULT_WINDOW_LINE_TEXT, ExpandLevel,
+    LineFormats, RawConfig, StartPage, load_config, normalize_config, parse_ssh_config_hosts,
 };
 use crate::model::{
     GpuBadge, GpuInfo, HostTree, HostUpdate, NodeId, PaneInfo, ProcessInfo, RowStatus, VisibleRow,
@@ -19,13 +19,17 @@ use crate::remote::{
     mark_created_times_at, mark_pane_gpu_indices, pane_busy_duration, parse_gpu_processes,
     parse_gpu_snapshot, parse_gpus, parse_panes, shell_quote,
 };
-use crate::tree::{SearchStart, build_rows, expanded_all, format_line, host_detail, search_rows};
+use crate::tree::{
+    SearchStart, build_active_pane_rows, build_rows, expanded_all, format_line, host_detail,
+    search_rows,
+};
 use crate::ui::{
     confirm_area, confirm_choice_at_mouse, context_menu_area, split_choice_area,
     split_choice_at_mouse, test_render_row_line,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use toml::Value;
 
 #[test]
@@ -425,6 +429,35 @@ fn keyboard_create_menu_shortcut_runs_selected_action() {
 }
 
 #[test]
+fn active_pane_page_filters_to_busy_panes_only() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut idle = test_pane();
+    idle.pane_id = "%1".to_string();
+    idle.pane_index = "1".to_string();
+    tree.panes.push(idle);
+
+    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].id, NodeId::Pane { .. }));
+    assert_eq!(rows[0].busy_duration_secs, Some(42));
+}
+
+#[test]
+fn active_pane_page_uses_independent_line_template() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut formats = test_line_formats();
+    formats.active_pane = "{server_name} {pane_id} {process_elapsed_time}".to_string();
+    formats.pane = "{pane_commandline}".to_string();
+
+    let rows = build_active_pane_rows(&[tree], &formats);
+
+    assert_eq!(rows[0].label, "t2 %0 42s");
+}
+
+#[test]
 fn context_menu_width_includes_shortcut_suffix() {
     let items = vec![ContextMenuItem {
         label: "new session".to_string(),
@@ -465,8 +498,13 @@ fn right_click_window_menu_can_attach() {
 
     let target = app.attach_request.unwrap();
     assert_eq!(target.host, "t2");
-    assert_eq!(target.session, "main");
-    assert_eq!(target.window, "0");
+    assert_eq!(
+        target.destination,
+        AttachDestination::Window {
+            session: "main".to_string(),
+            window: "0".to_string(),
+        }
+    );
 }
 
 #[test]
@@ -498,9 +536,62 @@ fn right_click_pane_menu_can_attach() {
 
     let target = app.attach_request.unwrap();
     assert_eq!(target.host, "t2");
-    assert_eq!(target.session, "main");
-    assert_eq!(target.window, "0");
-    assert_eq!(target.pane, "%0");
+    assert_eq!(
+        target.destination,
+        AttachDestination::Pane {
+            session: "main".to_string(),
+            window: "0".to_string(),
+            pane: "%0".to_string(),
+        }
+    );
+}
+
+#[test]
+fn window_attach_remote_command_targets_window_directly() {
+    let command = attach_remote_command(&AttachDestination::Window {
+        session: "main".to_string(),
+        window: "2".to_string(),
+    });
+
+    assert_eq!(command, "tmux attach-session -t 'main:2'");
+    assert!(!command.contains("switch-client"));
+    assert!(!command.contains("new-session"));
+}
+
+#[test]
+fn pane_attach_remote_command_targets_pane_directly() {
+    let command = attach_remote_command(&AttachDestination::Pane {
+        session: "main".to_string(),
+        window: "2".to_string(),
+        pane: "%9".to_string(),
+    });
+
+    assert_eq!(command, "tmux attach-session -t 'main:2.%9'");
+    assert!(!command.contains("switch-client"));
+    assert!(!command.contains("new-session"));
+}
+
+#[test]
+fn switch_key_toggles_between_tree_and_active_pane_pages() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut app = test_app_with_tree(tree);
+
+    assert_eq!(app.page_mode, PageMode::Tree);
+    assert!(app.rows.iter().any(|row| matches!(row.id, NodeId::Host(_))));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert_eq!(app.page_mode, PageMode::ActivePanes);
+    assert_eq!(app.rows.len(), 1);
+    assert!(matches!(app.rows[0].id, NodeId::Pane { .. }));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert_eq!(app.page_mode, PageMode::Tree);
+    assert!(app.rows.iter().any(|row| matches!(row.id, NodeId::Host(_))));
 }
 
 #[test]
@@ -715,6 +806,72 @@ fn pane_current_path_placeholder_is_available() {
         .find(|row| matches!(row.id, NodeId::Pane { .. }))
         .unwrap();
     assert_eq!(pane_row.label, "/tmp/project");
+}
+
+#[test]
+fn collapse_user_shortens_home_prefixed_pane_values() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].pane_commandline = "/star-home/yelingxuan/code/train.py --epochs 1".to_string();
+    tree.panes[0].pane_current_path = "/star-home/yelingxuan/code".to_string();
+    let mut formats = test_line_formats();
+    formats.pane = "{pane_commandline} {pane_current_path}".to_string();
+
+    let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+    let pane_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    assert_eq!(pane_row.label, "~/code/train.py --epochs 1 ~/code");
+}
+
+#[test]
+fn explicit_template_color_overrides_default_row_foreground_only_for_placeholder() {
+    let tree = test_host_tree("t2");
+    let mut formats = test_line_formats();
+    formats.pane = "[Pane] {pane_id:red} {pane_current_command}".to_string();
+
+    let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+    let pane_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    assert_eq!(pane_row.label, "[Pane] %0 pwsh");
+    assert_eq!(
+        pane_row
+            .label_spans
+            .iter()
+            .find(|span| span.text == "%0")
+            .and_then(|span| span.fg),
+        Some(Color::Red)
+    );
+    assert!(
+        pane_row
+            .label_spans
+            .iter()
+            .find(|span| span.text.contains("pwsh"))
+            .is_some_and(|span| span.fg.is_none())
+    );
+}
+
+#[test]
+fn explicit_hex_template_color_is_supported() {
+    let tree = test_host_tree("t2");
+    let mut formats = test_line_formats();
+    formats.session = "{session_name:#112233}".to_string();
+
+    let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+    let session_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Session { .. }))
+        .unwrap();
+
+    assert_eq!(session_row.label, "main");
+    assert_eq!(
+        session_row.label_spans[0].fg,
+        Some(Color::Rgb(0x11, 0x22, 0x33))
+    );
 }
 
 #[test]
@@ -1065,6 +1222,85 @@ fn gpu_memory_badges_round_to_nearest_decile() {
 }
 
 #[test]
+fn active_pane_gpu_badges_show_total_heat_and_pane_usage_digit() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    tree.gpus = vec![
+        GpuInfo {
+            index: 0,
+            uuid: "GPU-a".to_string(),
+            memory_used_mib: 4096,
+            memory_total_mib: 8192,
+        },
+        GpuInfo {
+            index: 1,
+            uuid: "GPU-b".to_string(),
+            memory_used_mib: 7680,
+            memory_total_mib: 8192,
+        },
+    ];
+    tree.panes[0].gpu_memory_by_index = vec![(1, 2048)];
+
+    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+
+    assert_eq!(
+        rows[0].gpu_badges,
+        vec![
+            GpuBadge::ActivePaneMemory {
+                digit: '5',
+                level: 1,
+                pane_active: false,
+            },
+            GpuBadge::ActivePaneMemory {
+                digit: '3',
+                level: 3,
+                pane_active: true,
+            },
+        ]
+    );
+    assert_eq!(rows[0].gpu_badges.len(), 2);
+}
+
+#[test]
+fn active_pane_gpu_badges_render_explicit_blue_pane_usage_cell() {
+    let mut row = test_row("python train.py");
+    row.gpu_badges = vec![GpuBadge::ActivePaneMemory {
+        digit: '3',
+        level: 3,
+        pane_active: true,
+    }];
+
+    let line = test_render_row_line(&row, 20);
+    let pane_span = line.spans.last().unwrap();
+
+    assert_eq!(pane_span.content.as_ref(), "3");
+    assert_eq!(pane_span.style.fg, Some(Color::White));
+    assert_eq!(pane_span.style.bg, Some(Color::Blue));
+}
+
+#[test]
+fn active_pane_gpu_badges_keep_one_cell_per_gpu() {
+    let mut row = test_row("python train.py");
+    row.gpu_badges = vec![
+        GpuBadge::ActivePaneMemory {
+            digit: '5',
+            level: 1,
+            pane_active: false,
+        },
+        GpuBadge::ActivePaneMemory {
+            digit: '3',
+            level: 3,
+            pane_active: true,
+        },
+    ];
+
+    let line = test_render_row_line(&row, 20);
+
+    assert_eq!(line.spans[line.spans.len() - 2].content.as_ref(), "5");
+    assert_eq!(line.spans[line.spans.len() - 1].content.as_ref(), "3");
+}
+
+#[test]
 fn gpu_badges_keep_right_edge_when_row_text_is_long() {
     let mut row = test_row("very-long-command-line-that-would-overflow-the-row");
     row.gpu_badges = vec![
@@ -1264,15 +1500,67 @@ fn default_auto_refresh_interval_is_configured() {
         mouse_scroll_lines: None,
         auto_refresh_secs: None,
         default_expand_level: None,
+        start_page: None,
+        collapse_user: None,
         log_path: None,
         server_line_text: None,
         session_line_text: None,
         window_line_text: None,
         pane_line_text: None,
+        active_pane_line_text: None,
     };
 
     let config = normalize_config(raw).unwrap();
     assert_eq!(config.auto_refresh_secs, DEFAULT_AUTO_REFRESH_SECS);
+    assert_eq!(config.start_page, DEFAULT_START_PAGE);
+    assert!(config.collapse_user);
+}
+
+#[test]
+fn start_page_can_default_to_active_view() {
+    let raw = RawConfig {
+        hosts: Some(Value::Array(vec![Value::String("t2".to_string())])),
+        connect_timeout_secs: None,
+        scan_concurrency: None,
+        mouse_scroll_lines: None,
+        auto_refresh_secs: None,
+        default_expand_level: None,
+        start_page: Some("active".to_string()),
+        collapse_user: None,
+        log_path: None,
+        server_line_text: None,
+        session_line_text: None,
+        window_line_text: None,
+        pane_line_text: None,
+        active_pane_line_text: None,
+    };
+
+    let config = normalize_config(raw).unwrap();
+    assert_eq!(config.start_page, StartPage::Active);
+}
+
+#[test]
+fn app_can_start_on_active_page_from_config() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut app = App::new(Config {
+        hosts: vec!["t2".to_string()],
+        connect_timeout_secs: 1,
+        scan_concurrency: 1,
+        mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
+        auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
+        default_expand_level: DEFAULT_EXPAND_LEVEL,
+        start_page: StartPage::Active,
+        collapse_user: true,
+        log_path: None,
+        line_formats: test_line_formats(),
+    });
+
+    app.apply_scan_results(vec![pane_update_from_tree(&tree)]);
+
+    assert_eq!(app.page_mode, PageMode::ActivePanes);
+    assert_eq!(app.rows.len(), 1);
+    assert!(matches!(app.rows[0].id, NodeId::Pane { .. }));
 }
 
 #[test]
@@ -1329,6 +1617,8 @@ fn test_app_with_rows(count: usize) -> App {
             mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
             auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
             default_expand_level: DEFAULT_EXPAND_LEVEL,
+            start_page: StartPage::Tree,
+            collapse_user: true,
             log_path: None,
             line_formats: test_line_formats(),
         },
@@ -1350,6 +1640,7 @@ fn test_app_with_rows(count: usize) -> App {
         mode: Mode::Normal,
         pending_g: false,
         default_expand_pending: false,
+        page_mode: PageMode::Tree,
         attach_request: None,
         refresh_request: None,
     }
@@ -1367,6 +1658,8 @@ fn test_app_with_tree_at_level(tree: HostTree, default_expand_level: ExpandLevel
         mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
         auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
         default_expand_level,
+        start_page: StartPage::Tree,
+        collapse_user: true,
         log_path: None,
         line_formats: test_line_formats(),
     };
@@ -1388,6 +1681,7 @@ fn test_app_with_tree_at_level(tree: HostTree, default_expand_level: ExpandLevel
         mode: Mode::Normal,
         pending_g: false,
         default_expand_pending: true,
+        page_mode: PageMode::Tree,
         attach_request: None,
         refresh_request: None,
     };
@@ -1403,6 +1697,8 @@ fn test_app_with_hosts(hosts: Vec<String>) -> App {
         mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
         auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
         default_expand_level: DEFAULT_EXPAND_LEVEL,
+        start_page: StartPage::Tree,
+        collapse_user: true,
         log_path: None,
         line_formats: test_line_formats(),
     })
@@ -1435,6 +1731,9 @@ fn test_line_formats() -> LineFormats {
         session: DEFAULT_SESSION_LINE_TEXT.to_string(),
         window: DEFAULT_WINDOW_LINE_TEXT.to_string(),
         pane: DEFAULT_PANE_LINE_TEXT.to_string(),
+        active_pane: DEFAULT_ACTIVE_PANE_LINE_TEXT.to_string(),
+        collapse_user: true,
+        user_home: Some("/star-home/yelingxuan".to_string()),
     }
 }
 
@@ -1481,6 +1780,10 @@ fn test_row(search_text: &str) -> VisibleRow {
         id: NodeId::Host(search_text.to_string()),
         depth: 0,
         label: search_text.to_string(),
+        label_spans: vec![crate::model::RowLabelSpan {
+            text: search_text.to_string(),
+            fg: None,
+        }],
         detail: String::new(),
         search_text: search_text.to_string(),
         selectable: false,

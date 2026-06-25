@@ -10,21 +10,21 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::config::{Config, ExpandLevel};
+use crate::config::{Config, ExpandLevel, StartPage};
 use crate::model::{HostTree, HostUpdate, NodeId, VisibleRow};
 use crate::remote::{
     collect_gpu_updates_streaming, collect_pane_updates_streaming, mark_pane_gpu_indices,
     shell_quote, sort_trees_by_config, ssh_options,
 };
 use crate::tree::{
-    SearchStart, build_rows, expandable_node_ids, group_tree, parent_id, search_rows,
+    SearchStart, build_active_pane_rows, build_rows, expandable_node_ids, group_tree, parent_id,
+    search_rows,
 };
 use crate::ui::{
     confirm_choice_at_mouse, context_menu_area, menu_item_at_mouse, split_choice_at_mouse,
 };
 
-const DEFAULT_STATUS: &str =
-    "Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
+const DEFAULT_STATUS: &str = "s switch page | Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
 const STATUS_TTL: Duration = Duration::from_secs(3);
 const GPU_SCAN_START_DELAY: Duration = Duration::from_millis(750);
 
@@ -46,8 +46,38 @@ pub(crate) struct App {
     pub(crate) mode: Mode,
     pub(crate) pending_g: bool,
     pub(crate) default_expand_pending: bool,
+    pub(crate) page_mode: PageMode,
     pub(crate) attach_request: Option<AttachTarget>,
     pub(crate) refresh_request: Option<RefreshRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageMode {
+    Tree,
+    ActivePanes,
+}
+
+impl PageMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Tree => Self::ActivePanes,
+            Self::ActivePanes => Self::Tree,
+        }
+    }
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::ActivePanes => "active panes",
+        }
+    }
+
+    pub(crate) fn subtitle(self) -> &'static str {
+        match self {
+            Self::Tree => "server / session / window / pane",
+            Self::ActivePanes => "flat view of panes with running processes",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,6 +337,10 @@ impl ConfirmAction {
 
 impl App {
     pub(crate) fn new(config: Config) -> Self {
+        let page_mode = match config.start_page {
+            StartPage::Tree => PageMode::Tree,
+            StartPage::Active => PageMode::ActivePanes,
+        };
         let mut app = Self {
             config,
             trees: Vec::new(),
@@ -325,6 +359,7 @@ impl App {
             mode: Mode::Normal,
             pending_g: false,
             default_expand_pending: true,
+            page_mode,
             attach_request: None,
             refresh_request: None,
         };
@@ -499,7 +534,28 @@ impl App {
     fn rebuild_rows(&mut self) {
         let expandable = expandable_node_ids(&self.trees);
         self.expanded.retain(|id| expandable.contains(id));
-        self.rows = build_rows(&self.trees, &self.expanded, &self.config.line_formats);
+        self.rows = match self.page_mode {
+            PageMode::Tree => build_rows(&self.trees, &self.expanded, &self.config.line_formats),
+            PageMode::ActivePanes => build_active_pane_rows(&self.trees, &self.config.line_formats),
+        };
+    }
+
+    fn toggle_page_mode(&mut self) {
+        self.pending_g = false;
+        let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        self.page_mode = self.page_mode.toggled();
+        self.rebuild_rows();
+        if let Some(selected_id) = selected_id {
+            if let Some(index) = self.rows.iter().position(|row| row.id == selected_id) {
+                self.selected = index;
+            } else {
+                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+            }
+        } else {
+            self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        }
+        self.clamp_scroll();
+        self.fit_scroll_to_height(self.viewport_height);
     }
 
     pub(crate) fn select_next(&mut self) {
@@ -708,43 +764,23 @@ impl App {
                 pane,
             } => Some(AttachTarget {
                 host: host.clone(),
-                session: session.clone(),
-                window: window.clone(),
-                pane: pane.clone(),
+                destination: AttachDestination::Pane {
+                    session: session.clone(),
+                    window: window.clone(),
+                    pane: pane.clone(),
+                },
             }),
             NodeId::Window {
                 host,
                 session,
                 window,
-            } => {
-                let pane = self
-                    .trees
-                    .iter()
-                    .find(|tree| &tree.host == host)?
-                    .panes
-                    .iter()
-                    .find(|pane| {
-                        &pane.session_name == session
-                            && &pane.window_index == window
-                            && pane.active_pane
-                    })
-                    .or_else(|| {
-                        self.trees
-                            .iter()
-                            .find(|tree| &tree.host == host)?
-                            .panes
-                            .iter()
-                            .find(|pane| {
-                                &pane.session_name == session && &pane.window_index == window
-                            })
-                    })?;
-                Some(AttachTarget {
-                    host: host.clone(),
+            } => Some(AttachTarget {
+                host: host.clone(),
+                destination: AttachDestination::Window {
                     session: session.clone(),
                     window: window.clone(),
-                    pane: pane.pane_id.clone(),
-                })
-            }
+                },
+            }),
             _ => None,
         }
     }
@@ -1064,6 +1100,7 @@ impl App {
                 self.request_refresh_all();
                 self.set_temp_status("refreshing in background");
             }
+            KeyCode::Char('s') => self.toggle_page_mode(),
             KeyCode::Char('G') => self.select_last(),
             KeyCode::Char('g') if self.pending_g => self.select_first(),
             KeyCode::Char('g') => self.pending_g = true,
@@ -1677,49 +1714,72 @@ impl App {
     }
 }
 
-pub(crate) struct AttachTarget {
-    pub(crate) host: String,
-    pub(crate) session: String,
-    pub(crate) window: String,
-    pub(crate) pane: String,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AttachDestination {
+    Default,
+    Session {
+        session: String,
+    },
+    Window {
+        session: String,
+        window: String,
+    },
+    Pane {
+        session: String,
+        window: String,
+        pane: String,
+    },
 }
 
-pub(crate) fn attach_host(
-    host: &str,
-    session: Option<&str>,
-    window: Option<&str>,
-    pane: Option<&str>,
-    connect_timeout_secs: u64,
-) -> Result<()> {
-    let remote_command = match (session, window, pane) {
-        (Some(session), Some(window), Some(pane)) => format!(
-            "tmux switch-client -t {}; tmux select-window -t {}; tmux select-pane -t {}; tmux attach-session -t {}",
-            shell_quote(session),
-            shell_quote(&format!("{session}:{window}")),
-            shell_quote(pane),
-            shell_quote(session),
-        ),
-        (Some(session), _, _) => format!("tmux attach-session -t {}", shell_quote(session)),
-        (None, _, _) => "tmux attach-session".to_string(),
-    };
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AttachTarget {
+    pub(crate) host: String,
+    pub(crate) destination: AttachDestination,
+}
+
+pub(crate) fn attach_host(target: &AttachTarget, connect_timeout_secs: u64) -> Result<()> {
+    let remote_command = attach_remote_command(&target.destination);
 
     let mut child = Command::new("ssh")
         .arg("-t")
         .args(ssh_options(connect_timeout_secs))
-        .arg(host)
+        .arg(&target.host)
         .arg(remote_command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to start ssh for host {host}"))?;
+        .with_context(|| format!("failed to start ssh for host {}", target.host))?;
 
     let status = child.wait()?;
     if !status.success() {
-        bail!("ssh/tmux attach failed for host {host}: {status}");
+        bail!("ssh/tmux attach failed for host {}: {status}", target.host);
     }
 
     Ok(())
+}
+
+pub(crate) fn attach_remote_command(destination: &AttachDestination) -> String {
+    match destination {
+        AttachDestination::Default => "tmux attach-session".to_string(),
+        AttachDestination::Session { session } => {
+            format!("tmux attach-session -t {}", shell_quote(session))
+        }
+        AttachDestination::Window { session, window } => {
+            format!(
+                "tmux attach-session -t {}",
+                shell_quote(&format!("{session}:{window}"))
+            )
+        }
+        AttachDestination::Pane {
+            session,
+            window,
+            pane,
+        } => format!(
+            "tmux attach-session -t {}",
+            shell_quote(&format!("{session}:{window}.{pane}"))
+        ),
+    }
 }
 
 fn create_remote_session(
