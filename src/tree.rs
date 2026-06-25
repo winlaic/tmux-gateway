@@ -489,6 +489,12 @@ fn format_pane_line(
     );
     insert_template_value(
         &mut values,
+        "pane_command_cwd",
+        pane.pane_command_cwd.clone(),
+        line_formats,
+    );
+    insert_template_value(
+        &mut values,
         "pane_title",
         pane.pane_title.clone(),
         line_formats,

@@ -17,7 +17,7 @@ use crate::model::{
 };
 use crate::remote::{
     mark_created_times_at, mark_pane_gpu_indices, pane_busy_duration, parse_gpu_processes,
-    parse_gpu_snapshot, parse_gpus, parse_panes, shell_quote,
+    parse_gpu_snapshot, parse_gpus, parse_panes, parse_process_cwds, shell_quote,
 };
 use crate::tree::{
     SearchStart, build_active_pane_rows, build_rows, expanded_all, format_line, host_detail,
@@ -862,12 +862,28 @@ fn pane_current_path_placeholder_is_available() {
 }
 
 #[test]
+fn pane_command_cwd_placeholder_is_available() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].pane_command_cwd = "/tmp/worker".to_string();
+    let mut formats = test_line_formats();
+    formats.pane = "{pane_command_cwd}".to_string();
+
+    let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
+    let pane_row = rows
+        .iter()
+        .find(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+    assert_eq!(pane_row.label, "/tmp/worker");
+}
+
+#[test]
 fn collapse_user_shortens_home_prefixed_pane_values() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].pane_commandline = "/star-home/yelingxuan/code/train.py --epochs 1".to_string();
     tree.panes[0].pane_current_path = "/star-home/yelingxuan/code".to_string();
+    tree.panes[0].pane_command_cwd = "/star-home/yelingxuan/code/run".to_string();
     let mut formats = test_line_formats();
-    formats.pane = "{pane_commandline} {pane_current_path}".to_string();
+    formats.pane = "{pane_commandline} {pane_current_path} {pane_command_cwd}".to_string();
 
     let rows = build_rows(&[tree], &expanded_all(&[test_host_tree("t2")]), &formats);
     let pane_row = rows
@@ -875,7 +891,20 @@ fn collapse_user_shortens_home_prefixed_pane_values() {
         .find(|row| matches!(row.id, NodeId::Pane { .. }))
         .unwrap();
 
-    assert_eq!(pane_row.label, "~/code/train.py --epochs 1 ~/code");
+    assert_eq!(pane_row.label, "~/code/train.py --epochs 1 ~/code ~/code/run");
+}
+
+#[test]
+fn parse_process_cwds_reads_batched_pwdx_output() {
+    let output = "123: /tmp/project\n456: /star-home/yelingxuan/code run\n";
+
+    let cwd_by_pid = parse_process_cwds(output);
+
+    assert_eq!(cwd_by_pid.get(&123).map(String::as_str), Some("/tmp/project"));
+    assert_eq!(
+        cwd_by_pid.get(&456).map(String::as_str),
+        Some("/star-home/yelingxuan/code run")
+    );
 }
 
 #[test]
@@ -1865,6 +1894,7 @@ fn test_pane() -> PaneInfo {
         pane_current_command: "pwsh".to_string(),
         pane_commandline: "pwsh -NoLogo".to_string(),
         pane_current_path: "/tmp/project".to_string(),
+        pane_command_cwd: "/tmp/project".to_string(),
         pane_title: String::new(),
         active_window: true,
         active_pane: true,

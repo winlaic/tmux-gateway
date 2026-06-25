@@ -16,6 +16,7 @@ pub(crate) struct PaneInfo {
     pub(crate) pane_current_command: String,
     pub(crate) pane_commandline: String,
     pub(crate) pane_current_path: String,
+    pub(crate) pane_command_cwd: String,
     pub(crate) pane_title: String,
     pub(crate) active_window: bool,
     pub(crate) active_pane: bool,

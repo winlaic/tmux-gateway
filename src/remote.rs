@@ -171,7 +171,7 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<PaneSnapsh
     .join("\t");
 
     let remote_command = format!(
-        "printf '%s\\n' __TMUX_GATEWAY_PANES__; tmux list-panes -a -F {}; printf '%s\\n' __TMUX_GATEWAY_PROCESSES__; ps -eo pid=,ppid=,etimes=,comm=,args= 2>/dev/null || true",
+        "printf '%s\\n' __TMUX_GATEWAY_PANES__; tmux list-panes -a -F {}; printf '%s\\n' __TMUX_GATEWAY_PROCESSES__; ps -eo pid=,ppid=,etimes=,comm=,args= -ww 2>/dev/null || true",
         shell_quote(&format),
     );
     let output = Command::new("ssh")
@@ -201,8 +201,28 @@ fn list_remote_panes(host: &str, connect_timeout_secs: u64) -> Result<PaneSnapsh
 
     let stdout = String::from_utf8(output.stdout)
         .with_context(|| format!("tmux output from host {host} was not utf-8"))?;
-    parse_remote_snapshot(&stdout)
-        .with_context(|| format!("failed to parse tmux panes from host {host}"))
+    let mut snapshot = parse_remote_snapshot(&stdout)
+        .with_context(|| format!("failed to parse tmux panes from host {host}"))?;
+
+    mark_created_times(&mut snapshot.panes, &snapshot.processes);
+    let process_by_pid = process_by_pid(&snapshot.processes);
+    let children_by_parent = children_by_parent(&snapshot.processes);
+    mark_busy_panes(&mut snapshot.panes, &process_by_pid, &children_by_parent);
+
+    if let Ok(cwd_by_pid) = collect_remote_process_cwds(
+        host,
+        connect_timeout_secs,
+        pane_display_pids(&snapshot.panes, &process_by_pid, &children_by_parent),
+    ) {
+        apply_pane_command_cwds(
+            &mut snapshot.panes,
+            &cwd_by_pid,
+            &process_by_pid,
+            &children_by_parent,
+        );
+    }
+
+    Ok(snapshot)
 }
 
 fn parse_remote_snapshot(output: &str) -> Result<PaneSnapshot> {
@@ -230,10 +250,8 @@ fn parse_remote_snapshot(output: &str) -> Result<PaneSnapshot> {
         }
     }
 
-    let mut panes = parse_panes(&pane_lines.join("\n"))?;
+    let panes = parse_panes(&pane_lines.join("\n"))?;
     let processes = parse_processes(&process_lines.join("\n"));
-    mark_created_times(&mut panes, &processes);
-    mark_busy_panes(&mut panes, &processes);
     Ok(PaneSnapshot { panes, processes })
 }
 
@@ -264,6 +282,7 @@ pub(crate) fn parse_panes(output: &str) -> Result<Vec<PaneInfo>> {
             pane_current_command: fields[9].to_string(),
             pane_commandline: fields[9].to_string(),
             pane_current_path: fields[10].to_string(),
+            pane_command_cwd: fields[10].to_string(),
             pane_title: fields[11].to_string(),
             active_window: fields[12] == "1",
             active_pane: fields[13] == "1",
@@ -425,7 +444,7 @@ pub(crate) fn parse_gpu_snapshot(output: &str) -> Result<(Vec<GpuInfo>, Vec<GpuP
     ))
 }
 
-fn parse_processes(output: &str) -> Vec<ProcessInfo> {
+pub(crate) fn parse_processes(output: &str) -> Vec<ProcessInfo> {
     output
         .lines()
         .filter_map(|line| {
@@ -446,31 +465,69 @@ fn parse_processes(output: &str) -> Vec<ProcessInfo> {
         .collect()
 }
 
-fn mark_busy_panes(panes: &mut [PaneInfo], processes: &[ProcessInfo]) {
-    let commandline_by_pid: BTreeMap<u32, String> = processes
-        .iter()
-        .map(|process| (process.pid, process.commandline.clone()))
-        .collect();
-    let process_by_pid: BTreeMap<u32, &ProcessInfo> = processes
-        .iter()
-        .map(|process| (process.pid, process))
-        .collect();
-    let mut children_by_parent: BTreeMap<u32, Vec<&ProcessInfo>> = BTreeMap::new();
-    for process in processes {
-        children_by_parent
-            .entry(process.ppid)
-            .or_default()
-            .push(process);
+fn mark_busy_panes(
+    panes: &mut [PaneInfo],
+    process_by_pid: &BTreeMap<u32, &ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
+) {
+    for pane in panes {
+        if let Some(process) = pane_display_process(pane, process_by_pid, children_by_parent) {
+            pane.pane_commandline = process.commandline.clone();
+        }
+        pane.busy_duration_secs = pane_busy_duration(pane, process_by_pid, children_by_parent);
+    }
+}
+
+fn collect_remote_process_cwds(
+    host: &str,
+    connect_timeout_secs: u64,
+    pids: BTreeSet<u32>,
+) -> Result<BTreeMap<u32, String>> {
+    if pids.is_empty() {
+        return Ok(BTreeMap::new());
     }
 
+    let pid_args = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remote_command = format!(
+        "if command -v pwdx >/dev/null 2>&1; then pwdx {pid_args} 2>/dev/null || true; else for pid in {pid_args}; do cwd=$(readlink \"/proc/$pid/cwd\" 2>/dev/null || true); printf '%s: %s\\n' \"$pid\" \"$cwd\"; done; fi",
+    );
+    Ok(parse_process_cwds(&run_remote_optional(
+        host,
+        connect_timeout_secs,
+        &remote_command,
+    )?))
+}
+
+pub(crate) fn parse_process_cwds(output: &str) -> BTreeMap<u32, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pid, cwd) = line.split_once(':')?;
+            Some((pid.trim().parse().ok()?, cwd.trim_start().to_string()))
+        })
+        .collect()
+}
+
+fn apply_pane_command_cwds(
+    panes: &mut [PaneInfo],
+    cwd_by_pid: &BTreeMap<u32, String>,
+    process_by_pid: &BTreeMap<u32, &ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
+) {
     for pane in panes {
-        if let Some(commandline) = commandline_by_pid.get(&pane.pane_pid) {
-            pane.pane_commandline = commandline.clone();
+        let Some(process) = pane_display_process(pane, process_by_pid, children_by_parent) else {
+            continue;
+        };
+        let Some(cwd) = cwd_by_pid.get(&process.pid) else {
+            continue;
+        };
+        if !cwd.is_empty() {
+            pane.pane_command_cwd = cwd.clone();
         }
-        if let Some(commandline) = pane_active_commandline(pane, &children_by_parent) {
-            pane.pane_commandline = commandline;
-        }
-        pane.busy_duration_secs = pane_busy_duration(pane, &process_by_pid, &children_by_parent);
     }
 }
 
@@ -528,15 +585,26 @@ fn pane_process_tree(root_pid: u32, children_by_parent: &BTreeMap<u32, Vec<u32>>
     process_tree
 }
 
-fn pane_active_commandline(
+fn pane_running_process<'a>(
     pane: &PaneInfo,
-    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
-) -> Option<String> {
-    if pane.pane_pid == 0 || !is_shell_command(&pane.pane_current_command) {
+    process_by_pid: &BTreeMap<u32, &'a ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&'a ProcessInfo>>,
+) -> Option<&'a ProcessInfo> {
+    if pane.pane_pid == 0 {
         return None;
     }
 
-    let mut best: Option<(u64, String)> = None;
+    if let Some(process) = process_by_pid.get(&pane.pane_pid) {
+        if !is_shell_command(&process.command) {
+            return Some(process);
+        }
+    }
+
+    if !is_shell_command(&pane.pane_current_command) {
+        return None;
+    }
+
+    let mut best: Option<&ProcessInfo> = None;
     let mut stack = children_by_parent
         .get(&pane.pane_pid)
         .cloned()
@@ -544,8 +612,8 @@ fn pane_active_commandline(
     while let Some(process) = stack.pop() {
         if !is_shell_command(&process.command) {
             match &best {
-                Some((elapsed, _)) if *elapsed >= process.elapsed_secs => {}
-                _ => best = Some((process.elapsed_secs, process.commandline.clone())),
+                Some(best_process) if best_process.elapsed_secs >= process.elapsed_secs => {}
+                _ => best = Some(process),
             }
         }
         if let Some(children) = children_by_parent.get(&process.pid) {
@@ -553,7 +621,27 @@ fn pane_active_commandline(
         }
     }
 
-    best.map(|(_, commandline)| commandline)
+    best
+}
+
+fn pane_display_process<'a>(
+    pane: &PaneInfo,
+    process_by_pid: &BTreeMap<u32, &'a ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&'a ProcessInfo>>,
+) -> Option<&'a ProcessInfo> {
+    pane_running_process(pane, process_by_pid, children_by_parent)
+        .or_else(|| process_by_pid.get(&pane.pane_pid).copied())
+}
+
+fn pane_display_pids(
+    panes: &[PaneInfo],
+    process_by_pid: &BTreeMap<u32, &ProcessInfo>,
+    children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
+) -> BTreeSet<u32> {
+    panes.iter()
+        .filter_map(|pane| pane_display_process(pane, process_by_pid, children_by_parent))
+        .map(|process| process.pid)
+        .collect()
 }
 
 pub(crate) fn pane_busy_duration(
@@ -561,31 +649,25 @@ pub(crate) fn pane_busy_duration(
     process_by_pid: &BTreeMap<u32, &ProcessInfo>,
     children_by_parent: &BTreeMap<u32, Vec<&ProcessInfo>>,
 ) -> Option<u64> {
-    if pane.pane_pid == 0 {
-        return None;
-    }
+    pane_running_process(pane, process_by_pid, children_by_parent).map(|process| process.elapsed_secs)
+}
 
-    if let Some(process) = process_by_pid.get(&pane.pane_pid) {
-        if !is_shell_command(&process.command) {
-            return Some(process.elapsed_secs);
-        }
-    }
+fn process_by_pid(processes: &[ProcessInfo]) -> BTreeMap<u32, &ProcessInfo> {
+    processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect()
+}
 
-    let mut max_elapsed = None;
-    let mut stack = children_by_parent
-        .get(&pane.pane_pid)
-        .cloned()
-        .unwrap_or_default();
-    while let Some(process) = stack.pop() {
-        if !is_shell_command(&process.command) {
-            max_elapsed = Some(max_elapsed.unwrap_or(0).max(process.elapsed_secs));
-        }
-        if let Some(children) = children_by_parent.get(&process.pid) {
-            stack.extend(children.iter().copied());
-        }
+fn children_by_parent(processes: &[ProcessInfo]) -> BTreeMap<u32, Vec<&ProcessInfo>> {
+    let mut children_by_parent = BTreeMap::new();
+    for process in processes {
+        children_by_parent
+            .entry(process.ppid)
+            .or_insert_with(Vec::new)
+            .push(process);
     }
-
-    max_elapsed
+    children_by_parent
 }
 
 fn is_shell_command(command: &str) -> bool {
