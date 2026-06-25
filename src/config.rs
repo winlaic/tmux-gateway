@@ -19,7 +19,7 @@ pub(crate) const DEFAULT_WINDOW_LINE_TEXT: &str =
     "[Window] {is_active}{window_index}: {window_name}";
 pub(crate) const DEFAULT_PANE_LINE_TEXT: &str =
     "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}";
-pub(crate) const DEFAULT_ACTIVE_PANE_LINE_TEXT: &str = "[Active] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_commandline}";
+pub(crate) const DEFAULT_ACTIVE_PANE_LINE_TEXT: &str = "[Pane] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_commandline}";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawConfig {
@@ -64,7 +64,7 @@ pub(crate) enum ExpandLevel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartPage {
     Tree,
-    Active,
+    Panes,
 }
 
 #[derive(Clone, Debug)]
@@ -197,8 +197,8 @@ fn parse_start_page(value: Option<&str>) -> Result<StartPage> {
 
     match value.trim().to_lowercase().as_str() {
         "tree" => Ok(StartPage::Tree),
-        "active" => Ok(StartPage::Active),
-        other => bail!("unsupported start_page {other:?}; expected tree or active"),
+        "panes" | "active" => Ok(StartPage::Panes),
+        other => bail!("unsupported start_page {other:?}; expected tree or panes"),
     }
 }
 

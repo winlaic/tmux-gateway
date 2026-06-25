@@ -21,8 +21,7 @@ use crate::remote::{
     parse_gpu_snapshot, parse_gpus, parse_panes, parse_process_cwds, shell_quote,
 };
 use crate::tree::{
-    SearchStart, build_active_pane_rows, build_rows, expanded_all, format_line, host_detail,
-    search_rows,
+    SearchStart, build_pane_rows, build_rows, expanded_all, format_line, host_detail, search_rows,
 };
 use crate::ui::{
     confirm_area, confirm_choice_at_mouse, context_menu_area, split_choice_area,
@@ -513,7 +512,7 @@ fn active_pane_new_window_uses_owning_window_target() {
 }
 
 #[test]
-fn active_pane_page_filters_to_busy_panes_only() {
+fn panes_page_hides_idle_panes_by_default() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].busy_duration_secs = Some(42);
     let mut idle = test_pane();
@@ -521,7 +520,7 @@ fn active_pane_page_filters_to_busy_panes_only() {
     idle.pane_index = "1".to_string();
     tree.panes.push(idle);
 
-    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+    let rows = build_pane_rows(&[tree], &test_line_formats(), true);
 
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0].id, NodeId::Pane { .. }));
@@ -529,20 +528,36 @@ fn active_pane_page_filters_to_busy_panes_only() {
 }
 
 #[test]
-fn active_pane_page_uses_independent_line_template() {
+fn panes_page_can_include_idle_panes_when_filter_is_disabled() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut idle = test_pane();
+    idle.pane_id = "%1".to_string();
+    idle.pane_index = "1".to_string();
+    tree.panes.push(idle);
+
+    let rows = build_pane_rows(&[tree], &test_line_formats(), false);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].busy_duration_secs, Some(42));
+    assert_eq!(rows[1].busy_duration_secs, None);
+}
+
+#[test]
+fn panes_page_uses_independent_line_template() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].busy_duration_secs = Some(42);
     let mut formats = test_line_formats();
     formats.active_pane = "{server_name} {pane_id} {process_elapsed_time}".to_string();
     formats.pane = "{pane_commandline}".to_string();
 
-    let rows = build_active_pane_rows(&[tree], &formats);
+    let rows = build_pane_rows(&[tree], &formats, true);
 
     assert_eq!(rows[0].label, "t2 %0 42s");
 }
 
 #[test]
-fn active_pane_page_adds_structure_prefix_for_panes_in_same_window() {
+fn panes_page_adds_structure_prefix_for_panes_in_same_window() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].busy_duration_secs = Some(42);
 
@@ -560,7 +575,7 @@ fn active_pane_page_adds_structure_prefix_for_panes_in_same_window() {
     tree.panes.push(sibling);
     tree.panes.push(other_window);
 
-    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+    let rows = build_pane_rows(&[tree], &test_line_formats(), true);
 
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].structure_prefix, "╭─");
@@ -569,7 +584,7 @@ fn active_pane_page_adds_structure_prefix_for_panes_in_same_window() {
 }
 
 #[test]
-fn active_pane_page_uses_top_middle_bottom_prefixes_for_three_panes() {
+fn panes_page_uses_top_middle_bottom_prefixes_for_three_panes() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].busy_duration_secs = Some(42);
 
@@ -586,12 +601,43 @@ fn active_pane_page_uses_top_middle_bottom_prefixes_for_three_panes() {
     tree.panes.push(middle);
     tree.panes.push(last);
 
-    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+    let rows = build_pane_rows(&[tree], &test_line_formats(), true);
 
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].structure_prefix, "╭─");
     assert_eq!(rows[1].structure_prefix, "├─");
     assert_eq!(rows[2].structure_prefix, "╰─");
+}
+
+#[test]
+fn dot_toggles_idle_pane_visibility_on_panes_page() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+    let mut idle = test_pane();
+    idle.pane_id = "%1".to_string();
+    idle.pane_index = "1".to_string();
+    tree.panes.push(idle);
+    let mut app = test_app_with_tree(tree);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert_eq!(app.page_mode, PageMode::Panes);
+    assert!(app.hide_idle_panes);
+    assert_eq!(app.rows.len(), 1);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert!(!app.hide_idle_panes);
+    assert_eq!(app.rows.len(), 2);
+    assert_eq!(app.rows[1].busy_duration_secs, None);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert!(app.hide_idle_panes);
+    assert_eq!(app.rows.len(), 1);
 }
 
 #[test]
@@ -762,7 +808,7 @@ fn switch_key_toggles_between_tree_and_active_pane_pages() {
     app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
         .unwrap();
 
-    assert_eq!(app.page_mode, PageMode::ActivePanes);
+    assert_eq!(app.page_mode, PageMode::Panes);
     assert_eq!(app.rows.len(), 1);
     assert!(matches!(app.rows[0].id, NodeId::Pane { .. }));
 
@@ -1455,7 +1501,7 @@ fn active_pane_gpu_badges_show_total_heat_and_pane_usage_digit() {
     ];
     tree.panes[0].gpu_memory_by_index = vec![(1, 2048)];
 
-    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+    let rows = build_pane_rows(&[tree], &test_line_formats(), true);
 
     assert_eq!(
         rows[0].gpu_badges,
@@ -1790,7 +1836,7 @@ fn default_auto_refresh_interval_is_configured() {
 }
 
 #[test]
-fn start_page_can_default_to_active_view() {
+fn start_page_accepts_panes_and_active_alias() {
     let raw = RawConfig {
         hosts: Some(Value::Array(vec![Value::String("t2".to_string())])),
         connect_timeout_secs: None,
@@ -1809,11 +1855,31 @@ fn start_page_can_default_to_active_view() {
     };
 
     let config = normalize_config(raw).unwrap();
-    assert_eq!(config.start_page, StartPage::Active);
+    assert_eq!(config.start_page, StartPage::Panes);
+
+    let panes_raw = RawConfig {
+        hosts: Some(Value::Array(vec![Value::String("t2".to_string())])),
+        connect_timeout_secs: None,
+        scan_concurrency: None,
+        mouse_scroll_lines: None,
+        auto_refresh_secs: None,
+        default_expand_level: None,
+        start_page: Some("panes".to_string()),
+        collapse_user: None,
+        log_path: None,
+        server_line_text: None,
+        session_line_text: None,
+        window_line_text: None,
+        pane_line_text: None,
+        active_pane_line_text: None,
+    };
+
+    let panes_config = normalize_config(panes_raw).unwrap();
+    assert_eq!(panes_config.start_page, StartPage::Panes);
 }
 
 #[test]
-fn app_can_start_on_active_page_from_config() {
+fn app_can_start_on_panes_page_from_config() {
     let mut tree = test_host_tree("t2");
     tree.panes[0].busy_duration_secs = Some(42);
     let mut app = App::new(Config {
@@ -1823,7 +1889,7 @@ fn app_can_start_on_active_page_from_config() {
         mouse_scroll_lines: DEFAULT_MOUSE_SCROLL_LINES,
         auto_refresh_secs: DEFAULT_AUTO_REFRESH_SECS,
         default_expand_level: DEFAULT_EXPAND_LEVEL,
-        start_page: StartPage::Active,
+        start_page: StartPage::Panes,
         collapse_user: true,
         log_path: None,
         line_formats: test_line_formats(),
@@ -1831,7 +1897,7 @@ fn app_can_start_on_active_page_from_config() {
 
     app.apply_scan_results(vec![pane_update_from_tree(&tree)]);
 
-    assert_eq!(app.page_mode, PageMode::ActivePanes);
+    assert_eq!(app.page_mode, PageMode::Panes);
     assert_eq!(app.rows.len(), 1);
     assert!(matches!(app.rows[0].id, NodeId::Pane { .. }));
 }
@@ -1914,6 +1980,7 @@ fn test_app_with_rows(count: usize) -> App {
         pending_g: false,
         default_expand_pending: false,
         page_mode: PageMode::Tree,
+        hide_idle_panes: true,
         attach_request: None,
         refresh_request: None,
     }
@@ -1955,6 +2022,7 @@ fn test_app_with_tree_at_level(tree: HostTree, default_expand_level: ExpandLevel
         pending_g: false,
         default_expand_pending: true,
         page_mode: PageMode::Tree,
+        hide_idle_panes: true,
         attach_request: None,
         refresh_request: None,
     };

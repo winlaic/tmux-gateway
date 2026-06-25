@@ -17,14 +17,14 @@ use crate::remote::{
     shell_quote, sort_trees_by_config, ssh_options,
 };
 use crate::tree::{
-    SearchStart, build_active_pane_rows, build_rows, expandable_node_ids, group_tree, parent_id,
+    SearchStart, build_pane_rows, build_rows, expandable_node_ids, group_tree, parent_id,
     search_rows,
 };
 use crate::ui::{
     confirm_choice_at_mouse, context_menu_area, menu_item_at_mouse, split_choice_at_mouse,
 };
 
-const DEFAULT_STATUS: &str = "s switch page | Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
+const DEFAULT_STATUS: &str = "s switch page | . hide/show idle panes | Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
 const STATUS_TTL: Duration = Duration::from_secs(3);
 const GPU_SCAN_START_DELAY: Duration = Duration::from_millis(750);
 
@@ -47,6 +47,7 @@ pub(crate) struct App {
     pub(crate) pending_g: bool,
     pub(crate) default_expand_pending: bool,
     pub(crate) page_mode: PageMode,
+    pub(crate) hide_idle_panes: bool,
     pub(crate) attach_request: Option<AttachTarget>,
     pub(crate) refresh_request: Option<RefreshRequest>,
 }
@@ -54,28 +55,28 @@ pub(crate) struct App {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageMode {
     Tree,
-    ActivePanes,
+    Panes,
 }
 
 impl PageMode {
     fn toggled(self) -> Self {
         match self {
-            Self::Tree => Self::ActivePanes,
-            Self::ActivePanes => Self::Tree,
+            Self::Tree => Self::Panes,
+            Self::Panes => Self::Tree,
         }
     }
 
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Tree => "tree",
-            Self::ActivePanes => "active panes",
+            Self::Panes => "panes",
         }
     }
 
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
             Self::Tree => "server / session / window / pane",
-            Self::ActivePanes => "flat view of panes with running processes",
+            Self::Panes => "flat view of panes (. toggles idle panes)",
         }
     }
 }
@@ -341,7 +342,7 @@ impl App {
     pub(crate) fn new(config: Config) -> Self {
         let page_mode = match config.start_page {
             StartPage::Tree => PageMode::Tree,
-            StartPage::Active => PageMode::ActivePanes,
+            StartPage::Panes => PageMode::Panes,
         };
         let mut app = Self {
             config,
@@ -362,6 +363,7 @@ impl App {
             pending_g: false,
             default_expand_pending: true,
             page_mode,
+            hide_idle_panes: true,
             attach_request: None,
             refresh_request: None,
         };
@@ -538,7 +540,9 @@ impl App {
         self.expanded.retain(|id| expandable.contains(id));
         self.rows = match self.page_mode {
             PageMode::Tree => build_rows(&self.trees, &self.expanded, &self.config.line_formats),
-            PageMode::ActivePanes => build_active_pane_rows(&self.trees, &self.config.line_formats),
+            PageMode::Panes => {
+                build_pane_rows(&self.trees, &self.config.line_formats, self.hide_idle_panes)
+            }
         };
     }
 
@@ -558,6 +562,33 @@ impl App {
         }
         self.clamp_scroll();
         self.fit_scroll_to_height(self.viewport_height);
+    }
+
+    fn toggle_idle_panes(&mut self) {
+        self.pending_g = false;
+        if self.page_mode != PageMode::Panes {
+            return;
+        }
+
+        let selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        self.hide_idle_panes = !self.hide_idle_panes;
+        self.rebuild_rows();
+        if let Some(selected_id) = selected_id {
+            if let Some(index) = self.rows.iter().position(|row| row.id == selected_id) {
+                self.selected = index;
+            } else {
+                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+            }
+        } else {
+            self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        }
+        self.clamp_scroll();
+        self.fit_scroll_to_height(self.viewport_height);
+        self.set_temp_status(if self.hide_idle_panes {
+            "panes page: hiding idle panes"
+        } else {
+            "panes page: showing all panes"
+        });
     }
 
     pub(crate) fn select_next(&mut self) {
@@ -913,7 +944,7 @@ impl App {
             return Vec::new();
         };
         let active_pane_row =
-            self.page_mode == PageMode::ActivePanes && matches!(row.id, NodeId::Pane { .. });
+            self.page_mode == PageMode::Panes && matches!(row.id, NodeId::Pane { .. });
 
         let mut items = Vec::new();
         if matches!(row.id, NodeId::Window { .. } | NodeId::Pane { .. }) {
@@ -1123,6 +1154,7 @@ impl App {
                 self.set_temp_status("refreshing in background");
             }
             KeyCode::Char('s') => self.toggle_page_mode(),
+            KeyCode::Char('.') => self.toggle_idle_panes(),
             KeyCode::Char('G') => self.select_last(),
             KeyCode::Char('g') if self.pending_g => self.select_first(),
             KeyCode::Char('g') => self.pending_g = true,
@@ -1207,7 +1239,7 @@ impl App {
             return Vec::new();
         };
 
-        if self.page_mode == PageMode::ActivePanes && matches!(row.id, NodeId::Pane { .. }) {
+        if self.page_mode == PageMode::Panes && matches!(row.id, NodeId::Pane { .. }) {
             return vec![
                 ContextMenuItem {
                     label: "new session".to_string(),

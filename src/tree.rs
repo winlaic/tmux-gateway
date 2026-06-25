@@ -168,15 +168,16 @@ pub(crate) fn build_rows(
     rows
 }
 
-pub(crate) fn build_active_pane_rows(
+pub(crate) fn build_pane_rows(
     trees: &[HostTree],
     line_formats: &LineFormats,
+    hide_idle_panes: bool,
 ) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
     let now_epoch = current_unix_epoch();
 
     for tree in trees {
-        for (session_name, windows) in group_busy_panes(tree) {
+        for (session_name, windows) in group_panes_for_page(tree, hide_idle_panes) {
             for (window_index, panes) in windows {
                 let pane_count = panes.len();
                 for (pane_position, pane) in panes.into_iter().enumerate() {
@@ -197,7 +198,7 @@ pub(crate) fn build_active_pane_rows(
                             pane: pane.pane_id.clone(),
                         },
                         depth: 0,
-                        structure_prefix: active_pane_structure_prefix(pane_position, pane_count),
+                        structure_prefix: pane_page_structure_prefix(pane_position, pane_count),
                         label: label.plain,
                         label_spans: label.spans,
                         detail: String::new(),
@@ -731,12 +732,15 @@ pub(crate) fn group_tree(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, V
     sessions
 }
 
-fn group_busy_panes(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> {
+fn group_panes_for_page(
+    tree: &HostTree,
+    hide_idle_panes: bool,
+) -> BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> {
     let mut sessions: BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> = BTreeMap::new();
     for pane in tree
         .panes
         .iter()
-        .filter(|pane| pane.busy_duration_secs.is_some())
+        .filter(|pane| !hide_idle_panes || pane.busy_duration_secs.is_some())
     {
         sessions
             .entry(pane.session_name.clone())
@@ -748,7 +752,7 @@ fn group_busy_panes(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, Vec<&P
     sessions
 }
 
-fn active_pane_structure_prefix(pane_position: usize, pane_count: usize) -> String {
+fn pane_page_structure_prefix(pane_position: usize, pane_count: usize) -> String {
     if pane_count <= 1 {
         return "  ".to_string();
     }

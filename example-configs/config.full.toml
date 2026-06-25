@@ -35,7 +35,7 @@ default_expand_level = "server"
 
 # Initial page shown at startup.
 # tree   = hierarchical server/session/window/pane view
-# active = flat view of panes with running processes
+# panes  = flat panes page; press . to show or hide idle panes
 start_page = "tree"
 
 # Server row format.
@@ -67,6 +67,6 @@ window_line_text = "[Window] {is_active}{window_index}: {window_name}"
 # {session_uptime} {window_uptime} {pane_uptime} {process_status} {process_elapsed_time}
 pane_line_text = "[Pane] {is_active}{pane_index} {pane_id} {process_elapsed_time} {pane_commandline}"
 
-# Active pane flat-page row format.
+# Panes-page row format.
 # Uses the same placeholders as pane_line_text, but is configured independently.
-active_pane_line_text = "[Active] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_current_path} {pane_commandline}"
+active_pane_line_text = "[Pane] {server_name} {session_name}:{window_index}.{pane_index} {process_elapsed_time} {pane_current_path} {pane_commandline}"

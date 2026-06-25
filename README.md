@@ -128,6 +128,7 @@ Common placeholders:
 - `Enter`: attach to selected window or pane.
 - `a`: create. On ambiguous levels, opens a menu such as `new session(s)` / `new window(w)`.
 - `x`: kill selected session/window/pane.
+- `.`: on the `panes` page, toggle hiding idle panes.
 - `r`: refresh now.
 - Right click: open context menu.
 - Mouse wheel: scroll the tree viewport.
