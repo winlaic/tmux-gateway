@@ -458,6 +458,59 @@ fn active_pane_page_uses_independent_line_template() {
 }
 
 #[test]
+fn active_pane_page_adds_structure_prefix_for_panes_in_same_window() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+
+    let mut sibling = test_pane();
+    sibling.pane_index = "1".to_string();
+    sibling.pane_id = "%1".to_string();
+    sibling.busy_duration_secs = Some(21);
+
+    let mut other_window = test_pane();
+    other_window.window_index = "1".to_string();
+    other_window.window_id = "@3".to_string();
+    other_window.pane_id = "%2".to_string();
+    other_window.busy_duration_secs = Some(7);
+
+    tree.panes.push(sibling);
+    tree.panes.push(other_window);
+
+    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].structure_prefix, "╭─");
+    assert_eq!(rows[1].structure_prefix, "╰─");
+    assert_eq!(rows[2].structure_prefix, "  ");
+}
+
+#[test]
+fn active_pane_page_uses_top_middle_bottom_prefixes_for_three_panes() {
+    let mut tree = test_host_tree("t2");
+    tree.panes[0].busy_duration_secs = Some(42);
+
+    let mut middle = test_pane();
+    middle.pane_index = "1".to_string();
+    middle.pane_id = "%1".to_string();
+    middle.busy_duration_secs = Some(21);
+
+    let mut last = test_pane();
+    last.pane_index = "2".to_string();
+    last.pane_id = "%2".to_string();
+    last.busy_duration_secs = Some(7);
+
+    tree.panes.push(middle);
+    tree.panes.push(last);
+
+    let rows = build_active_pane_rows(&[tree], &test_line_formats());
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].structure_prefix, "╭─");
+    assert_eq!(rows[1].structure_prefix, "├─");
+    assert_eq!(rows[2].structure_prefix, "╰─");
+}
+
+#[test]
 fn context_menu_width_includes_shortcut_suffix() {
     let items = vec![ContextMenuItem {
         label: "new session".to_string(),
@@ -1264,6 +1317,12 @@ fn active_pane_gpu_badges_show_total_heat_and_pane_usage_digit() {
 #[test]
 fn active_pane_gpu_badges_render_explicit_blue_pane_usage_cell() {
     let mut row = test_row("python train.py");
+    row.id = NodeId::Pane {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+        window: "0".to_string(),
+        pane: "%0".to_string(),
+    };
     row.gpu_badges = vec![GpuBadge::ActivePaneMemory {
         digit: '3',
         level: 3,
@@ -1281,6 +1340,12 @@ fn active_pane_gpu_badges_render_explicit_blue_pane_usage_cell() {
 #[test]
 fn active_pane_gpu_badges_keep_one_cell_per_gpu() {
     let mut row = test_row("python train.py");
+    row.id = NodeId::Pane {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+        window: "0".to_string(),
+        pane: "%0".to_string(),
+    };
     row.gpu_badges = vec![
         GpuBadge::ActivePaneMemory {
             digit: '5',
@@ -1298,6 +1363,53 @@ fn active_pane_gpu_badges_keep_one_cell_per_gpu() {
 
     assert_eq!(line.spans[line.spans.len() - 2].content.as_ref(), "5");
     assert_eq!(line.spans[line.spans.len() - 1].content.as_ref(), "3");
+}
+
+#[test]
+fn active_pane_structure_prefix_renders_before_label() {
+    let mut row = test_row("python train.py");
+    row.id = NodeId::Pane {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+        window: "0".to_string(),
+        pane: "%0".to_string(),
+    };
+    row.structure_prefix = "╰─".to_string();
+
+    let line = test_render_row_line(&row, 32);
+    let rendered: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+
+    assert!(
+        rendered.contains("╰─python train.py"),
+        "rendered={rendered:?}"
+    );
+}
+
+#[test]
+fn tree_pane_rows_keep_marker_slot_spacing_for_alignment() {
+    let mut row = test_row("python train.py");
+    row.id = NodeId::Pane {
+        host: "t2".to_string(),
+        session: "main".to_string(),
+        window: "0".to_string(),
+        pane: "%0".to_string(),
+    };
+
+    let line = test_render_row_line(&row, 32);
+    let rendered: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+
+    assert!(
+        rendered.contains("    python train.py"),
+        "rendered={rendered:?}"
+    );
 }
 
 #[test]
@@ -1779,6 +1891,7 @@ fn test_row(search_text: &str) -> VisibleRow {
     VisibleRow {
         id: NodeId::Host(search_text.to_string()),
         depth: 0,
+        structure_prefix: String::new(),
         label: search_text.to_string(),
         label_spans: vec![crate::model::RowLabelSpan {
             text: search_text.to_string(),

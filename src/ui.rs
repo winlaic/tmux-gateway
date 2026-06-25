@@ -51,7 +51,9 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .map(|(index, row)| {
             let selected = index == app.selected;
             let indent = "  ".repeat(row.depth);
-            let marker = if !row.expandable {
+            let marker = if !row.expandable && !row.structure_prefix.is_empty() {
+                ""
+            } else if !row.expandable {
                 " "
             } else if app.expanded.contains(&row.id) {
                 "▾"
@@ -100,10 +102,12 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 RowRenderParts {
                     cursor,
                     indent,
+                    structure_prefix: row.structure_prefix.clone(),
                     marker,
                     row_style,
                     main_style,
                     detail_style,
+                    structure_style: Style::default().fg(Color::Gray),
                     width: chunks[1].width.saturating_sub(2),
                 },
             ))
@@ -139,21 +143,35 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 struct RowRenderParts {
     cursor: &'static str,
     indent: String,
+    structure_prefix: String,
     marker: &'static str,
     row_style: Style,
     main_style: Style,
     detail_style: Style,
+    structure_style: Style,
     width: u16,
 }
 
 fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
+    let marker = if !row.structure_prefix.is_empty() && parts.marker == " " {
+        ""
+    } else {
+        parts.marker
+    };
+    let marker_gap = if marker.is_empty() {
+        ""
+    } else {
+        " "
+    };
     let label_width_limit = if row.gpu_badges.is_empty() {
         u16::MAX
     } else {
         let fixed_width = parts.cursor.chars().count() as u16
             + parts.indent.chars().count() as u16
-            + parts.marker.chars().count() as u16
-            + 2;
+            + parts.structure_prefix.chars().count() as u16
+            + marker.chars().count() as u16
+            + marker_gap.chars().count() as u16
+            + 1;
         let badge_width = gpu_badges_width(&row.gpu_badges);
         let badge_gap = if badge_width > 0 { 1 } else { 0 };
         parts
@@ -169,8 +187,9 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
         let mut spans = vec![
             Span::styled(parts.cursor, parts.row_style),
             Span::raw(parts.indent),
-            Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
+            Span::styled(parts.structure_prefix, parts.structure_style),
+            Span::styled(marker, Style::default().fg(Color::Yellow)),
+            Span::raw(marker_gap),
         ];
         spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
         spans.push(Span::raw(" "));
@@ -180,8 +199,10 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
 
     let fixed_width = parts.cursor.chars().count() as u16
         + parts.indent.chars().count() as u16
-        + parts.marker.chars().count() as u16
-        + 2;
+        + parts.structure_prefix.chars().count() as u16
+        + marker.chars().count() as u16
+        + marker_gap.chars().count() as u16
+        + 1;
     let badge_width = gpu_badges_width(&row.gpu_badges);
     let badge_gap = if badge_width > 0 { 1 } else { 0 };
     let text_width = parts
@@ -194,8 +215,9 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
     let mut spans = vec![
         Span::styled(parts.cursor, parts.row_style),
         Span::raw(parts.indent),
-        Span::styled(parts.marker, Style::default().fg(Color::Yellow)),
-        Span::raw(" "),
+        Span::styled(parts.structure_prefix, parts.structure_style),
+        Span::styled(marker, Style::default().fg(Color::Yellow)),
+        Span::raw(marker_gap),
     ];
     spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
     if !detail.is_empty() {
@@ -370,13 +392,16 @@ pub(crate) fn test_render_row_line(row: &VisibleRow, width: u16) -> Line<'static
         RowRenderParts {
             cursor: "  ",
             indent: "  ".repeat(row.depth),
+            structure_prefix: row.structure_prefix.clone(),
             marker: match row.id {
+                NodeId::Pane { .. } if !row.structure_prefix.is_empty() => "",
                 NodeId::Pane { .. } => " ",
                 _ => "▸",
             },
             row_style: Style::default(),
             main_style: Style::default(),
             detail_style: Style::default(),
+            structure_style: Style::default(),
             width,
         },
     )

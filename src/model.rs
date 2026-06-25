@@ -119,6 +119,7 @@ pub(crate) struct RowLabelSpan {
 pub(crate) struct VisibleRow {
     pub(crate) id: NodeId,
     pub(crate) depth: usize,
+    pub(crate) structure_prefix: String,
     pub(crate) label: String,
     pub(crate) label_spans: Vec<RowLabelSpan>,
     pub(crate) detail: String,

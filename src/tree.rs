@@ -29,6 +29,7 @@ pub(crate) fn build_rows(
         rows.push(VisibleRow {
             id: host_id.clone(),
             depth: 0,
+            structure_prefix: String::new(),
             label: label.plain,
             label_spans: label.spans,
             detail: detail.clone(),
@@ -65,6 +66,7 @@ pub(crate) fn build_rows(
             rows.push(VisibleRow {
                 id: session_id.clone(),
                 depth: 1,
+                structure_prefix: String::new(),
                 label: label.plain,
                 label_spans: label.spans,
                 detail: format!("{} windows", windows.len()),
@@ -102,6 +104,7 @@ pub(crate) fn build_rows(
                 rows.push(VisibleRow {
                     id: window_id.clone(),
                     depth: 2,
+                    structure_prefix: String::new(),
                     label: label.plain,
                     label_spans: label.spans,
                     detail: format!("{} panes", panes.len()),
@@ -140,6 +143,7 @@ pub(crate) fn build_rows(
                     rows.push(VisibleRow {
                         id: pane_id,
                         depth: 3,
+                        structure_prefix: String::new(),
                         label: label.plain,
                         label_spans: label.spans,
                         detail: String::new(),
@@ -172,47 +176,49 @@ pub(crate) fn build_active_pane_rows(
     let now_epoch = current_unix_epoch();
 
     for tree in trees {
-        for pane in tree
-            .panes
-            .iter()
-            .filter(|pane| pane.busy_duration_secs.is_some())
-        {
-            let label = format_pane_line(
-                &tree.host,
-                &pane.session_name,
-                &pane.window_index,
-                pane,
-                &line_formats.active_pane,
-                now_epoch,
-                line_formats,
-            );
-            rows.push(VisibleRow {
-                id: NodeId::Pane {
-                    host: tree.host.clone(),
-                    session: pane.session_name.clone(),
-                    window: pane.window_index.clone(),
-                    pane: pane.pane_id.clone(),
-                },
-                depth: 0,
-                label: label.plain,
-                label_spans: label.spans,
-                detail: String::new(),
-                search_text: format!(
-                    "{} {} {} {} {} {} {}",
-                    tree.host,
-                    pane.session_name,
-                    pane.window_index,
-                    pane.pane_index,
-                    pane.pane_id,
-                    pane.pane_current_command,
-                    pane.pane_commandline
-                ),
-                selectable: true,
-                expandable: false,
-                status: RowStatus::Normal,
-                busy_duration_secs: pane.busy_duration_secs,
-                gpu_badges: active_pane_gpu_badges(&tree.gpus, pane),
-            });
+        for (session_name, windows) in group_busy_panes(tree) {
+            for (window_index, panes) in windows {
+                let pane_count = panes.len();
+                for (pane_position, pane) in panes.into_iter().enumerate() {
+                    let label = format_pane_line(
+                        &tree.host,
+                        &session_name,
+                        &window_index,
+                        pane,
+                        &line_formats.active_pane,
+                        now_epoch,
+                        line_formats,
+                    );
+                    rows.push(VisibleRow {
+                        id: NodeId::Pane {
+                            host: tree.host.clone(),
+                            session: session_name.clone(),
+                            window: window_index.clone(),
+                            pane: pane.pane_id.clone(),
+                        },
+                        depth: 0,
+                        structure_prefix: active_pane_structure_prefix(pane_position, pane_count),
+                        label: label.plain,
+                        label_spans: label.spans,
+                        detail: String::new(),
+                        search_text: format!(
+                            "{} {} {} {} {} {} {}",
+                            tree.host,
+                            pane.session_name,
+                            pane.window_index,
+                            pane.pane_index,
+                            pane.pane_id,
+                            pane.pane_current_command,
+                            pane.pane_commandline
+                        ),
+                        selectable: true,
+                        expandable: false,
+                        status: RowStatus::Normal,
+                        busy_duration_secs: pane.busy_duration_secs,
+                        gpu_badges: active_pane_gpu_badges(&tree.gpus, pane),
+                    });
+                }
+            }
         }
     }
 
@@ -717,6 +723,39 @@ pub(crate) fn group_tree(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, V
             .push(pane);
     }
     sessions
+}
+
+fn group_busy_panes(tree: &HostTree) -> BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> {
+    let mut sessions: BTreeMap<String, BTreeMap<String, Vec<&PaneInfo>>> = BTreeMap::new();
+    for pane in tree
+        .panes
+        .iter()
+        .filter(|pane| pane.busy_duration_secs.is_some())
+    {
+        sessions
+            .entry(pane.session_name.clone())
+            .or_default()
+            .entry(pane.window_index.clone())
+            .or_default()
+            .push(pane);
+    }
+    sessions
+}
+
+fn active_pane_structure_prefix(pane_position: usize, pane_count: usize) -> String {
+    if pane_count <= 1 {
+        return "  ".to_string();
+    }
+
+    if pane_position == 0 {
+        return "╭─".to_string();
+    }
+
+    if pane_position + 1 == pane_count {
+        "╰─".to_string()
+    } else {
+        "├─".to_string()
+    }
 }
 
 pub(crate) fn max_busy_duration<'a>(panes: impl Iterator<Item = &'a PaneInfo>) -> Option<u64> {
