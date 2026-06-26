@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::style::Color;
+use regex::Regex;
 
 use crate::app::SearchDirection;
 use crate::config::LineFormats;
@@ -26,6 +27,7 @@ pub(crate) fn build_rows(
         let host_id = NodeId::Host(tree.host.clone());
         let detail = host_detail(tree);
         let label = format_server_line(tree, line_formats);
+        let search_text = row_search_text(&label.plain, &detail);
         rows.push(VisibleRow {
             id: host_id.clone(),
             depth: 0,
@@ -33,7 +35,7 @@ pub(crate) fn build_rows(
             label: label.plain,
             label_spans: label.spans,
             detail: detail.clone(),
-            search_text: format!("{} {}", tree.host, detail),
+            search_text,
             selectable: false,
             expandable: !tree.panes.is_empty(),
             status: if tree.error.is_some() {
@@ -63,14 +65,16 @@ pub(crate) fn build_rows(
             };
             let label =
                 format_session_line(tree, &session_name, windows.len(), line_formats, now_epoch);
+            let detail = format!("{} windows", windows.len());
+            let search_text = row_search_text(&label.plain, &detail);
             rows.push(VisibleRow {
                 id: session_id.clone(),
                 depth: 1,
                 structure_prefix: String::new(),
                 label: label.plain,
                 label_spans: label.spans,
-                detail: format!("{} windows", windows.len()),
-                search_text: session_name.clone(),
+                detail,
+                search_text,
                 selectable: false,
                 expandable: !windows.is_empty(),
                 status: RowStatus::Normal,
@@ -87,7 +91,6 @@ pub(crate) fn build_rows(
             }
 
             for (window_index, panes) in windows {
-                let first = panes[0];
                 let window_id = NodeId::Window {
                     host: tree.host.clone(),
                     session: session_name.clone(),
@@ -101,14 +104,16 @@ pub(crate) fn build_rows(
                     line_formats,
                     now_epoch,
                 );
+                let detail = format!("{} panes", panes.len());
+                let search_text = row_search_text(&label.plain, &detail);
                 rows.push(VisibleRow {
                     id: window_id.clone(),
                     depth: 2,
                     structure_prefix: String::new(),
                     label: label.plain,
                     label_spans: label.spans,
-                    detail: format!("{} panes", panes.len()),
-                    search_text: format!("{} {}", window_index, first.window_name),
+                    detail,
+                    search_text,
                     selectable: true,
                     expandable: !panes.is_empty(),
                     status: RowStatus::Normal,
@@ -140,6 +145,7 @@ pub(crate) fn build_rows(
                         now_epoch,
                         line_formats,
                     );
+                    let search_text = row_search_text(&label.plain, "");
                     rows.push(VisibleRow {
                         id: pane_id,
                         depth: 3,
@@ -147,13 +153,7 @@ pub(crate) fn build_rows(
                         label: label.plain,
                         label_spans: label.spans,
                         detail: String::new(),
-                        search_text: format!(
-                            "{} {} {} {}",
-                            pane.pane_index,
-                            pane.pane_id,
-                            pane.pane_current_command,
-                            pane.pane_title
-                        ),
+                        search_text,
                         selectable: true,
                         expandable: false,
                         status: RowStatus::Normal,
@@ -190,6 +190,7 @@ pub(crate) fn build_pane_rows(
                         now_epoch,
                         line_formats,
                     );
+                    let search_text = row_search_text(&label.plain, "");
                     rows.push(VisibleRow {
                         id: NodeId::Pane {
                             host: tree.host.clone(),
@@ -202,16 +203,7 @@ pub(crate) fn build_pane_rows(
                         label: label.plain,
                         label_spans: label.spans,
                         detail: String::new(),
-                        search_text: format!(
-                            "{} {} {} {} {} {} {}",
-                            tree.host,
-                            pane.session_name,
-                            pane.window_index,
-                            pane.pane_index,
-                            pane.pane_id,
-                            pane.pane_current_command,
-                            pane.pane_commandline
-                        ),
+                        search_text,
                         selectable: true,
                         expandable: false,
                         status: RowStatus::Normal,
@@ -899,7 +891,7 @@ fn human_duration(seconds: u64) -> String {
 pub(crate) fn search_rows(
     rows: &[VisibleRow],
     selected: usize,
-    needle: &str,
+    regex: &Regex,
     direction: SearchDirection,
     start: SearchStart,
 ) -> Option<usize> {
@@ -918,11 +910,23 @@ pub(crate) fn search_rows(
     match direction {
         SearchDirection::Down => (0..len)
             .map(|offset| (start_index + offset) % len)
-            .find(|&index| rows[index].search_text.to_lowercase().contains(needle)),
+            .find(|&index| regex.is_match(&rows[index].search_text)),
         SearchDirection::Up => (0..len)
             .map(|offset| (start_index + len - offset) % len)
-            .find(|&index| rows[index].search_text.to_lowercase().contains(needle)),
+            .find(|&index| regex.is_match(&rows[index].search_text)),
     }
+}
+
+pub(crate) fn compile_search_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    Regex::new(pattern)
+}
+
+pub(crate) fn search_match_ranges(text: &str, regex: &Regex) -> Vec<std::ops::Range<usize>> {
+    regex
+        .find_iter(text)
+        .filter(|matched| matched.start() != matched.end())
+        .map(|matched| matched.start()..matched.end())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -970,6 +974,14 @@ pub(crate) fn parent_id(id: &NodeId) -> Option<NodeId> {
             session: session.clone(),
             window: window.clone(),
         }),
+    }
+}
+
+fn row_search_text(label: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} {detail}")
     }
 }
 

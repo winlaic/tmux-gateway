@@ -25,11 +25,12 @@ use crate::tree::{
 };
 use crate::ui::{
     confirm_area, confirm_choice_at_mouse, context_menu_area, split_choice_area,
-    split_choice_at_mouse, test_render_row_line,
+    split_choice_at_mouse, test_render_row_line, test_render_row_line_with_search,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use regex::Regex;
 use toml::Value;
 
 #[test]
@@ -57,6 +58,7 @@ fn parse_panes_reads_tmux_format() {
 
 #[test]
 fn search_rows_wraps_by_direction() {
+    let regex = Regex::new("beta").unwrap();
     let rows = vec![
         test_row("alpha"),
         test_row("beta"),
@@ -68,22 +70,22 @@ fn search_rows_wraps_by_direction() {
         search_rows(
             &rows,
             2,
-            "beta",
+            &regex,
             SearchDirection::Down,
             SearchStart::Current,
         ),
         Some(3)
     );
     assert_eq!(
-        search_rows(&rows, 2, "beta", SearchDirection::Up, SearchStart::Current,),
+        search_rows(&rows, 2, &regex, SearchDirection::Up, SearchStart::Current,),
         Some(1)
     );
     assert_eq!(
-        search_rows(&rows, 1, "beta", SearchDirection::Down, SearchStart::Next,),
+        search_rows(&rows, 1, &regex, SearchDirection::Down, SearchStart::Next,),
         Some(3)
     );
     assert_eq!(
-        search_rows(&rows, 1, "beta", SearchDirection::Up, SearchStart::Next,),
+        search_rows(&rows, 1, &regex, SearchDirection::Up, SearchStart::Next,),
         Some(3)
     );
 }
@@ -118,6 +120,32 @@ fn child_rows_do_not_inherit_host_search_text() {
         rows.iter()
             .skip(1)
             .all(|row| !row.search_text.contains("t2"))
+    );
+}
+
+#[test]
+fn search_rows_uses_regex_on_rendered_line_text() {
+    let regex = Regex::new(r"\[Pane\].*%0.*pwsh").unwrap();
+    let tree = test_host_tree("t2");
+    let rows = build_rows(
+        &[tree],
+        &expanded_all(&[test_host_tree("t2")]),
+        &test_line_formats(),
+    );
+    let pane_index = rows
+        .iter()
+        .position(|row| matches!(row.id, NodeId::Pane { .. }))
+        .unwrap();
+
+    assert_eq!(
+        search_rows(
+            &rows,
+            pane_index,
+            &regex,
+            SearchDirection::Down,
+            SearchStart::Current,
+        ),
+        Some(pane_index)
     );
 }
 
@@ -1659,6 +1687,21 @@ fn rows_without_gpu_badges_keep_original_untrimmed_text() {
 }
 
 #[test]
+fn search_matches_are_temporarily_highlighted_in_rendered_row() {
+    let row = test_row("python train.py");
+
+    let line = test_render_row_line_with_search(&row, 32, "train\\.py");
+    let highlighted = line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "train.py")
+        .unwrap();
+
+    assert_eq!(highlighted.style.bg, Some(Color::Yellow));
+    assert_eq!(highlighted.style.fg, Some(Color::Black));
+}
+
+#[test]
 fn app_starts_with_connecting_placeholders() {
     let app = test_app_with_hosts(vec!["t1".to_string(), "t2".to_string()]);
 
@@ -1762,11 +1805,58 @@ fn refresh_requests_can_target_all_or_one_host() {
 fn starting_search_clears_previous_input() {
     let mut app = test_app_with_rows(3);
     app.search = "old".to_string();
+    app.search_regex = Some(Regex::new("old").unwrap());
+    app.search_error = Some("old error".to_string());
 
     app.start_search(SearchDirection::Down);
 
     assert_eq!(app.search, "");
+    assert!(app.search_regex.is_none());
+    assert!(app.search_error.is_none());
     assert_eq!(app.search_prompt(), "/");
+}
+
+#[test]
+fn esc_does_not_quit_in_normal_mode_but_q_does() {
+    let mut app = test_app_with_rows(3);
+
+    assert!(
+        !app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap()
+    );
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()))
+            .unwrap()
+    );
+}
+
+#[test]
+fn invalid_regex_is_reported_in_search_prompt() {
+    let mut app = test_app_with_rows(3);
+
+    app.start_search(SearchDirection::Down);
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::empty()))
+        .unwrap();
+
+    assert!(app.search_regex.is_none());
+    assert!(app.search_error.is_some());
+    assert!(app.search_prompt().contains("invalid regex"));
+}
+
+#[test]
+fn esc_exits_search_mode_without_quitting_app() {
+    let mut app = test_app_with_rows(3);
+
+    app.start_search(SearchDirection::Down);
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+        .unwrap();
+
+    assert!(matches!(app.mode, Mode::Search));
+    assert!(
+        !app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap()
+    );
+    assert!(matches!(app.mode, Mode::Normal));
 }
 
 #[test]
@@ -1974,6 +2064,8 @@ fn test_app_with_rows(count: usize) -> App {
         status: String::new(),
         status_expires_at: None,
         search: String::new(),
+        search_regex: None,
+        search_error: None,
         search_direction: SearchDirection::Down,
         last_search_direction: SearchDirection::Down,
         mode: Mode::Normal,
@@ -2016,6 +2108,8 @@ fn test_app_with_tree_at_level(tree: HostTree, default_expand_level: ExpandLevel
         status: String::new(),
         status_expires_at: None,
         search: String::new(),
+        search_regex: None,
+        search_error: None,
         search_direction: SearchDirection::Down,
         last_search_direction: SearchDirection::Down,
         mode: Mode::Normal,

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use regex::Regex;
 
 use crate::config::{Config, ExpandLevel, StartPage};
 use crate::model::{HostTree, HostUpdate, NodeId, VisibleRow};
@@ -17,8 +18,8 @@ use crate::remote::{
     shell_quote, sort_trees_by_config, ssh_options,
 };
 use crate::tree::{
-    SearchStart, build_pane_rows, build_rows, expandable_node_ids, group_tree, parent_id,
-    search_rows,
+    SearchStart, build_pane_rows, build_rows, compile_search_regex, expandable_node_ids,
+    group_tree, parent_id, search_rows,
 };
 use crate::ui::{
     confirm_choice_at_mouse, context_menu_area, menu_item_at_mouse, split_choice_at_mouse,
@@ -41,6 +42,8 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) status_expires_at: Option<Instant>,
     pub(crate) search: String,
+    pub(crate) search_regex: Option<Regex>,
+    pub(crate) search_error: Option<String>,
     pub(crate) search_direction: SearchDirection,
     pub(crate) last_search_direction: SearchDirection,
     pub(crate) mode: Mode,
@@ -357,6 +360,8 @@ impl App {
             status: "loading remote tmux trees".to_string(),
             status_expires_at: Some(Instant::now() + STATUS_TTL),
             search: String::new(),
+            search_regex: None,
+            search_error: None,
             search_direction: SearchDirection::Down,
             last_search_direction: SearchDirection::Down,
             mode: Mode::Normal,
@@ -1130,7 +1135,8 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         let code = key.code;
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Esc => self.pending_g = false,
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.page_down(self.viewport_height / 2)
             }
@@ -1176,6 +1182,8 @@ impl App {
     pub(crate) fn start_search(&mut self, direction: SearchDirection) {
         self.pending_g = false;
         self.search.clear();
+        self.search_regex = None;
+        self.search_error = None;
         self.search_direction = direction;
         self.last_search_direction = direction;
         self.mode = Mode::Search;
@@ -1785,26 +1793,27 @@ impl App {
             return;
         }
         self.search.push(ch);
+        self.refresh_search_regex();
         self.apply_search_from_current();
         self.set_status(self.search_prompt());
     }
 
     fn pop_search(&mut self) {
         self.search.pop();
+        self.refresh_search_regex();
         self.apply_search_from_current();
         self.set_status(self.search_prompt());
     }
 
     fn apply_search_from_current(&mut self) {
-        if self.search.is_empty() {
+        let Some(regex) = self.search_regex.as_ref() else {
             return;
-        }
+        };
 
-        let needle = self.search.to_lowercase();
         let found = search_rows(
             &self.rows,
             self.selected,
-            &needle,
+            regex,
             self.search_direction,
             SearchStart::Current,
         );
@@ -1822,11 +1831,19 @@ impl App {
             return;
         }
 
-        let needle = self.search.to_lowercase();
+        let Some(regex) = self.search_regex.as_ref() else {
+            let message = self
+                .search_error
+                .clone()
+                .unwrap_or_else(|| "invalid regex".to_string());
+            self.set_temp_status(format!("invalid regex: {message}"));
+            return;
+        };
+
         if let Some(index) = search_rows(
             &self.rows,
             self.selected,
-            &needle,
+            regex,
             direction,
             SearchStart::Next,
         ) {
@@ -1839,7 +1856,37 @@ impl App {
     }
 
     pub(crate) fn search_prompt(&self) -> String {
-        format!("{}{}", self.search_direction.prefix(), self.search)
+        match &self.search_error {
+            Some(error) => format!(
+                "{}{}  [invalid regex: {error}]",
+                self.search_direction.prefix(),
+                self.search
+            ),
+            None => format!("{}{}", self.search_direction.prefix(), self.search),
+        }
+    }
+
+    pub(crate) fn active_search_regex(&self) -> Option<&Regex> {
+        self.search_regex.as_ref()
+    }
+
+    fn refresh_search_regex(&mut self) {
+        if self.search.is_empty() {
+            self.search_regex = None;
+            self.search_error = None;
+            return;
+        }
+
+        match compile_search_regex(&self.search) {
+            Ok(regex) => {
+                self.search_regex = Some(regex);
+                self.search_error = None;
+            }
+            Err(err) => {
+                self.search_regex = None;
+                self.search_error = Some(err.to_string());
+            }
+        }
     }
 }
 

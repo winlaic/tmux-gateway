@@ -2,11 +2,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use regex::Regex;
 
 use crate::app::{App, ContextMenuItem, ContextMenuState, Mode, SplitChoice, prompt_help};
 #[cfg(test)]
 use crate::model::NodeId;
 use crate::model::{GpuBadge, RowLabelSpan, RowStatus, VisibleRow};
+use crate::tree::search_match_ranges;
 
 pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -50,6 +52,7 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .take(end.saturating_sub(app.scroll_offset))
         .map(|(index, row)| {
             let selected = index == app.selected;
+            let search_regex = app.active_search_regex();
             let indent = "  ".repeat(row.depth);
             let marker = if !row.expandable && !row.structure_prefix.is_empty() {
                 ""
@@ -110,6 +113,7 @@ pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                     structure_style: Style::default().fg(Color::Gray),
                     width: chunks[1].width.saturating_sub(2),
                 },
+                search_regex,
             ))
             .style(row_style)
         })
@@ -152,7 +156,11 @@ struct RowRenderParts {
     width: u16,
 }
 
-fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
+fn row_line(
+    row: &VisibleRow,
+    parts: RowRenderParts,
+    search_regex: Option<&Regex>,
+) -> Line<'static> {
     let marker = if !row.structure_prefix.is_empty() && parts.marker == " " {
         ""
     } else {
@@ -187,9 +195,13 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
             Span::styled(marker, Style::default().fg(Color::Yellow)),
             Span::raw(marker_gap),
         ];
-        spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(row.detail.clone(), parts.detail_style));
+        spans.extend(searchable_row_spans(
+            &trimmed_label_spans,
+            &row.detail,
+            parts.main_style,
+            parts.detail_style,
+            search_regex,
+        ));
         return Line::from(spans);
     }
 
@@ -215,14 +227,121 @@ fn row_line(row: &VisibleRow, parts: RowRenderParts) -> Line<'static> {
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::raw(marker_gap),
     ];
-    spans.extend(styled_label_spans(&trimmed_label_spans, parts.main_style));
-    if !detail.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(detail.clone(), parts.detail_style));
-    }
+    spans.extend(searchable_row_spans(
+        &trimmed_label_spans,
+        &detail,
+        parts.main_style,
+        parts.detail_style,
+        search_regex,
+    ));
 
     add_right_aligned_gpu_badges(&mut spans, row, parts.width, fixed_width + text_width);
     Line::from(spans)
+}
+
+fn searchable_row_spans(
+    label_spans: &[RowLabelSpan],
+    detail: &str,
+    main_style: Style,
+    detail_style: Style,
+    search_regex: Option<&Regex>,
+) -> Vec<Span<'static>> {
+    let mut segments = label_spans
+        .iter()
+        .map(|span| StyledSegment {
+            text: span.text.clone(),
+            style: match span.fg {
+                Some(color) => main_style.patch(Style::default().fg(color)),
+                None => main_style,
+            },
+        })
+        .collect::<Vec<_>>();
+    if !detail.is_empty() {
+        segments.push(StyledSegment {
+            text: " ".to_string(),
+            style: main_style,
+        });
+        segments.push(StyledSegment {
+            text: detail.to_string(),
+            style: detail_style,
+        });
+    }
+    highlight_segments(&segments, search_regex)
+}
+
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+fn highlight_segments(
+    segments: &[StyledSegment],
+    search_regex: Option<&Regex>,
+) -> Vec<Span<'static>> {
+    let Some(search_regex) = search_regex else {
+        return segments
+            .iter()
+            .map(|segment| Span::styled(segment.text.clone(), segment.style))
+            .collect();
+    };
+
+    let searchable_text = segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<String>();
+    let matches = search_match_ranges(&searchable_text, search_regex);
+    if matches.is_empty() {
+        return segments
+            .iter()
+            .map(|segment| Span::styled(segment.text.clone(), segment.style))
+            .collect();
+    }
+
+    let mut spans = Vec::new();
+    let mut segment_start = 0usize;
+    for segment in segments {
+        let segment_end = segment_start + segment.text.len();
+        let mut cursor = segment_start;
+        for matched in &matches {
+            let overlap_start = matched.start.max(segment_start);
+            let overlap_end = matched.end.min(segment_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            if cursor < overlap_start {
+                spans.push(Span::styled(
+                    segment.text[(cursor - segment_start)..(overlap_start - segment_start)]
+                        .to_string(),
+                    segment.style,
+                ));
+            }
+            spans.push(Span::styled(
+                segment.text[(overlap_start - segment_start)..(overlap_end - segment_start)]
+                    .to_string(),
+                search_highlight_style(segment.style),
+            ));
+            cursor = overlap_end;
+        }
+        if cursor < segment_end {
+            spans.push(Span::styled(
+                segment.text[(cursor - segment_start)..].to_string(),
+                segment.style,
+            ));
+        }
+        segment_start = segment_end;
+    }
+    spans
+}
+
+fn search_highlight_style(base_style: Style) -> Style {
+    base_style.patch(
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn add_right_aligned_gpu_badges(
@@ -286,19 +405,6 @@ fn trim_label_spans(spans: &[RowLabelSpan], width: u16) -> Vec<RowLabelSpan> {
         remaining -= take_len;
     }
     trimmed
-}
-
-fn styled_label_spans(spans: &[RowLabelSpan], base_style: Style) -> Vec<Span<'static>> {
-    spans
-        .iter()
-        .map(|span| {
-            let style = match span.fg {
-                Some(color) => base_style.patch(Style::default().fg(color)),
-                None => base_style,
-            };
-            Span::styled(span.text.clone(), style)
-        })
-        .collect()
 }
 
 fn spans_plain_text(spans: &[RowLabelSpan]) -> String {
@@ -400,6 +506,35 @@ pub(crate) fn test_render_row_line(row: &VisibleRow, width: u16) -> Line<'static
             structure_style: Style::default(),
             width,
         },
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_render_row_line_with_search(
+    row: &VisibleRow,
+    width: u16,
+    pattern: &str,
+) -> Line<'static> {
+    let search_regex = Regex::new(pattern).ok();
+    row_line(
+        row,
+        RowRenderParts {
+            cursor: "  ",
+            indent: "  ".repeat(row.depth),
+            structure_prefix: row.structure_prefix.clone(),
+            marker: match row.id {
+                NodeId::Pane { .. } if !row.structure_prefix.is_empty() => "",
+                NodeId::Pane { .. } => " ",
+                _ => "▸",
+            },
+            row_style: Style::default(),
+            main_style: Style::default(),
+            detail_style: Style::default(),
+            structure_style: Style::default(),
+            width,
+        },
+        search_regex.as_ref(),
     )
 }
 

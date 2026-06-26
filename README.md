@@ -132,7 +132,8 @@ Common placeholders:
 - `r`: refresh now.
 - Right click: open context menu.
 - Mouse wheel: scroll the tree viewport.
-- `q` or `Esc`: quit or cancel the active modal.
+- `q`: quit.
+- `Esc`: cancel the active menu, prompt, confirm, split, or search state.
 
 Menus support both selection plus Enter and direct shortcut keys shown in parentheses, such as `OK(y)` and `Cancel(n)`.
 
