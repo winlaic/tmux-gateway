@@ -847,7 +847,7 @@ fn active_gpu_indices<'a>(panes: impl Iterator<Item = &'a PaneInfo>) -> BTreeSet
         .collect()
 }
 
-fn rounded_memory_decile(memory_used_mib: u64, memory_total_mib: u64) -> u8 {
+pub(crate) fn rounded_memory_decile(memory_used_mib: u64, memory_total_mib: u64) -> u8 {
     if memory_total_mib == 0 {
         return 0;
     }
@@ -855,14 +855,14 @@ fn rounded_memory_decile(memory_used_mib: u64, memory_total_mib: u64) -> u8 {
     ((memory_used_mib.saturating_mul(100) / memory_total_mib + 5) / 10).min(10) as u8
 }
 
-fn decile_digit(decile: u8) -> char {
+pub(crate) fn decile_digit(decile: u8) -> char {
     match decile.min(10) {
         10 => 'A',
         value => char::from(b'0' + value),
     }
 }
 
-fn decile_level(decile: u8) -> u8 {
+pub(crate) fn decile_level(decile: u8) -> u8 {
     match decile.min(10) {
         0..=2 => 0,
         3..=5 => 1,

@@ -28,6 +28,7 @@ use crate::ui::{
 const DEFAULT_STATUS: &str = "s switch page | . hide/show idle panes | Enter attach | right-click menu | a/x add/kill | r reload | /? n/N | ^u/^d | gg/G | q";
 const STATUS_TTL: Duration = Duration::from_secs(3);
 const GPU_SCAN_START_DELAY: Duration = Duration::from_millis(750);
+pub(crate) const SERVER_PICKER_MAX_VISIBLE: usize = 12;
 
 pub(crate) struct App {
     pub(crate) config: Config,
@@ -223,6 +224,17 @@ pub(crate) enum Mode {
     Prompt(PromptState),
     SplitChoice(SplitChoiceState),
     Confirm(ConfirmState),
+    ServerPicker(ServerPickerState),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ServerPickerState {
+    pub(crate) all_hosts: Vec<String>,
+    pub(crate) filter: String,
+    pub(crate) filtered: Vec<String>,
+    pub(crate) selected: usize,
+    pub(crate) scroll_offset: usize,
+    pub(crate) searching: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -846,6 +858,10 @@ impl App {
                 self.handle_confirm_key(key.code)?;
                 Ok(false)
             }
+            Mode::ServerPicker(_) => {
+                self.handle_server_picker_key(key.code)?;
+                Ok(false)
+            }
         }
     }
 
@@ -862,6 +878,11 @@ impl App {
 
         if matches!(self.mode, Mode::Confirm(_)) {
             self.handle_confirm_mouse(mouse);
+            return;
+        }
+
+        if matches!(self.mode, Mode::ServerPicker(_)) {
+            self.handle_server_picker_mouse(mouse);
             return;
         }
 
@@ -1165,6 +1186,7 @@ impl App {
             KeyCode::Char('g') if self.pending_g => self.select_first(),
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('a') => self.start_create(),
+            KeyCode::Char('A') => self.start_server_picker(),
             KeyCode::Char('x') => self.start_kill(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
@@ -1281,6 +1303,145 @@ impl App {
                 )
             })
             .collect()
+    }
+
+    fn is_host_unavailable(&self, host: &str) -> bool {
+        self.trees
+            .iter()
+            .find(|t| t.host == host)
+            .map(|t| t.error.is_some() || t.connecting)
+            .unwrap_or(true)
+    }
+
+    fn start_server_picker(&mut self) {
+        self.pending_g = false;
+        let all_hosts = self.config.hosts.clone();
+        if all_hosts.is_empty() {
+            self.set_temp_status("no hosts configured");
+            return;
+        }
+        let filtered = all_hosts.clone();
+        self.mode = Mode::ServerPicker(ServerPickerState {
+            all_hosts,
+            filter: String::new(),
+            filtered,
+            selected: 0,
+            scroll_offset: 0,
+            searching: false,
+        });
+    }
+
+    fn handle_server_picker_key(&mut self, code: KeyCode) -> Result<()> {
+        let Mode::ServerPicker(mut state) = self.mode.clone() else {
+            return Ok(());
+        };
+
+        if state.searching {
+            match code {
+                KeyCode::Esc => {
+                    state.searching = false;
+                    state.filter.clear();
+                    state.filtered = state.all_hosts.clone();
+                    state.selected = state.selected.min(state.filtered.len().saturating_sub(1));
+                    state.scroll_offset = 0;
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Enter => {
+                    state.searching = false;
+                    update_server_picker_filter(&mut state);
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Backspace => {
+                    state.filter.pop();
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Char(ch) if !ch.is_control() => {
+                    state.filter.push(ch);
+                    self.mode = Mode::ServerPicker(state);
+                }
+                _ => self.mode = Mode::ServerPicker(state),
+            }
+        } else {
+            match code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.set_temp_status("server picker cancelled");
+                }
+                KeyCode::Char('/') => {
+                    state.searching = true;
+                    state.filter.clear();
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    server_picker_move_up(&mut state);
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    server_picker_move_down(&mut state);
+                    self.mode = Mode::ServerPicker(state);
+                }
+                KeyCode::Enter => {
+                    if let Some(host) = state.filtered.get(state.selected).cloned() {
+                        if self.is_host_unavailable(&host) {
+                            self.set_temp_status(format!(
+                                "{host}: unavailable, cannot create session"
+                            ));
+                            self.mode = Mode::ServerPicker(state);
+                        } else {
+                            let (result, attach_target) =
+                                split_attach_result(create_remote_session(
+                                    &host,
+                                    None,
+                                    self.config.connect_timeout_secs,
+                                    self.config.log_path.as_deref(),
+                                ));
+                            self.mode = Mode::Normal;
+                            self.request_refresh_host(host);
+                            if let Some(target) = attach_target {
+                                self.attach_request = Some(target);
+                            }
+                            self.set_temp_status(result_status(
+                                result,
+                                "session created",
+                                self.config.log_path.as_deref(),
+                            ));
+                        }
+                    } else {
+                        self.mode = Mode::ServerPicker(state);
+                        self.set_temp_status("no matching server");
+                    }
+                }
+                _ => self.mode = Mode::ServerPicker(state),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_server_picker_mouse(&mut self, mouse: MouseEvent) {
+        let Mode::ServerPicker(mut state) = self.mode.clone() else {
+            return;
+        };
+
+        let area = server_picker_list_area(self.screen_area, state.filtered.len());
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = server_picker_item_at_mouse(&state, &area, mouse.row) {
+                    state.selected = index;
+                    self.mode = Mode::ServerPicker(state);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                server_picker_move_up(&mut state);
+                self.mode = Mode::ServerPicker(state);
+            }
+            MouseEventKind::ScrollDown => {
+                server_picker_move_down(&mut state);
+                self.mode = Mode::ServerPicker(state);
+            }
+            _ => self.mode = Mode::ServerPicker(state),
+        }
     }
 
     fn start_create_session(&mut self) {
@@ -2286,6 +2447,102 @@ fn pane_title_for(trees: &[HostTree], host: &str, pane_id: &str) -> Option<Strin
         .iter()
         .find(|pane| pane.pane_id == pane_id)
         .map(|pane| pane.pane_title.clone())
+}
+
+fn update_server_picker_filter(state: &mut ServerPickerState) {
+    if state.filter.is_empty() {
+        state.filtered = state.all_hosts.clone();
+    } else {
+        let regex = Regex::new(&format!("(?i){}", &state.filter));
+        state.filtered = match regex {
+            Ok(re) => state
+                .all_hosts
+                .iter()
+                .filter(|host| re.is_match(host))
+                .cloned()
+                .collect(),
+            Err(_) => state.all_hosts.clone(),
+        };
+    }
+    state.selected = state.selected.min(state.filtered.len().saturating_sub(1));
+    state.scroll_offset = state.scroll_offset.min(
+        state
+            .filtered
+            .len()
+            .saturating_sub(SERVER_PICKER_MAX_VISIBLE),
+    );
+    if state.selected < state.scroll_offset {
+        state.scroll_offset = state.selected;
+    }
+}
+
+fn server_picker_move_up(state: &mut ServerPickerState) {
+    if state.filtered.is_empty() {
+        return;
+    }
+    if state.selected == 0 {
+        state.selected = state.filtered.len() - 1;
+        state.scroll_offset = state
+            .filtered
+            .len()
+            .saturating_sub(SERVER_PICKER_MAX_VISIBLE);
+    } else {
+        state.selected -= 1;
+        if state.selected < state.scroll_offset {
+            state.scroll_offset = state.selected;
+        }
+    }
+}
+
+fn server_picker_move_down(state: &mut ServerPickerState) {
+    if state.filtered.is_empty() {
+        return;
+    }
+    if state.selected >= state.filtered.len() - 1 {
+        state.selected = 0;
+        state.scroll_offset = 0;
+    } else {
+        state.selected += 1;
+        if state.selected >= state.scroll_offset + SERVER_PICKER_MAX_VISIBLE {
+            state.scroll_offset = state.selected - SERVER_PICKER_MAX_VISIBLE + 1;
+        }
+    }
+}
+
+pub(crate) fn server_picker_list_area(screen_area: Rect, item_count: usize) -> Rect {
+    let max_visible = SERVER_PICKER_MAX_VISIBLE;
+    let visible_count = item_count.min(max_visible);
+    let width: u16 = 44_u16.min(screen_area.width);
+    let height = ((visible_count as u16) + 5).min(screen_area.height);
+    Rect {
+        x: screen_area.x + screen_area.width.saturating_sub(width) / 2,
+        y: screen_area.y + screen_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn server_picker_item_at_mouse(
+    state: &ServerPickerState,
+    area: &Rect,
+    row: u16,
+) -> Option<usize> {
+    let list_start_y = area.y + 3;
+    if row < list_start_y {
+        return None;
+    }
+    let vi = (row - list_start_y) as usize;
+    let max_visible = SERVER_PICKER_MAX_VISIBLE;
+    let visible_count = state.filtered.len().min(max_visible);
+    if vi >= visible_count {
+        return None;
+    }
+    let absolute = state.scroll_offset + vi;
+    if absolute < state.filtered.len() {
+        Some(absolute)
+    } else {
+        None
+    }
 }
 
 fn split_attach_result(result: Result<AttachTarget>) -> (Result<()>, Option<AttachTarget>) {

@@ -4,11 +4,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use regex::Regex;
 
-use crate::app::{App, ContextMenuItem, ContextMenuState, Mode, SplitChoice, prompt_help};
+use crate::app::{
+    App, ContextMenuItem, ContextMenuState, Mode, SERVER_PICKER_MAX_VISIBLE, ServerPickerState,
+    SplitChoice, prompt_help,
+};
 #[cfg(test)]
 use crate::model::NodeId;
-use crate::model::{GpuBadge, RowLabelSpan, RowStatus, VisibleRow};
-use crate::tree::search_match_ranges;
+use crate::model::{GpuBadge, HostTree, RowLabelSpan, RowStatus, VisibleRow};
+use crate::tree::{decile_digit, decile_level, rounded_memory_decile, search_match_ranges};
 
 pub(crate) fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -629,8 +632,140 @@ fn draw_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
                 area,
             );
         }
+        Mode::ServerPicker(picker) => {
+            draw_server_picker(frame, picker, &app.trees);
+        }
         _ => {}
     }
+}
+
+fn draw_server_picker(
+    frame: &mut ratatui::Frame<'_>,
+    picker: &ServerPickerState,
+    trees: &[HostTree],
+) {
+    let max_visible = SERVER_PICKER_MAX_VISIBLE;
+    let visible_count = picker.filtered.len().min(max_visible);
+    let height = (visible_count as u16) + 5;
+    let area = centered_rect(44, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if picker.searching {
+        lines.push(Line::from(vec![
+            Span::styled("/ ", Style::default().fg(Color::Yellow)),
+            Span::raw(picker.filter.clone()),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else if !picker.filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(picker.filter.clone()),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+
+    for (vi, host) in picker
+        .filtered
+        .iter()
+        .skip(picker.scroll_offset)
+        .take(max_visible)
+        .enumerate()
+    {
+        let selected = picker.scroll_offset + vi == picker.selected;
+        let unavailable = is_host_unavailable(trees, host);
+        let gpu_spans = server_picker_gpu_spans(trees, host);
+        let gpu_width: usize = gpu_spans.iter().map(|s| s.content.len()).sum();
+        let name_budget = inner_width.saturating_sub(1 + gpu_width + 1);
+        let name_text = if host.len() > name_budget {
+            format!(" {:.width$}", host, width = name_budget)
+        } else {
+            format!(" {:<width$}", host, width = name_budget)
+        };
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if selected {
+            spans.push(Span::styled(
+                name_text,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            for s in gpu_spans {
+                spans.push(s);
+            }
+            let remaining = inner_width.saturating_sub(
+                spans.iter().map(|s| s.content.len()).sum::<usize>(),
+            );
+            if remaining > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(remaining),
+                    Style::default().bg(Color::Yellow),
+                ));
+            }
+        } else if unavailable {
+            spans.push(Span::styled(name_text, Style::default().fg(Color::Red)));
+        } else {
+            spans.push(Span::styled(name_text, Style::default().fg(Color::White)));
+            for s in gpu_spans {
+                spans.push(s);
+            }
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(""));
+    let help = if picker.searching {
+        "Enter: apply filter | Esc: clear filter"
+    } else {
+        "j/k: choose | Enter: create | /: filter | Esc: cancel"
+    };
+    lines.push(Line::from(Span::styled(
+        help,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("new session on server")),
+        area,
+    );
+}
+
+fn is_host_unavailable(trees: &[HostTree], host: &str) -> bool {
+    trees
+        .iter()
+        .find(|t| t.host == host)
+        .map(|t| t.error.is_some() || t.connecting)
+        .unwrap_or(true)
+}
+
+fn server_picker_gpu_spans(trees: &[HostTree], host: &str) -> Vec<Span<'static>> {
+    let Some(tree) = trees.iter().find(|t| t.host == host) else {
+        return Vec::new();
+    };
+    if tree.gpus.is_empty() {
+        return Vec::new();
+    }
+    tree.gpus
+        .iter()
+        .map(|gpu| {
+            let decile = rounded_memory_decile(gpu.memory_used_mib, gpu.memory_total_mib);
+            let level = decile_level(decile);
+            Span::styled(
+                decile_digit(decile).to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(gpu_memory_color(level)),
+            )
+        })
+        .collect()
 }
 
 fn choice_style(selected: bool) -> Style {
